@@ -1,5 +1,4 @@
 import asyncio
-import uuid
 from datetime import timedelta
 from typing import Any, Dict, Optional
 
@@ -176,8 +175,15 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
 
     task_ids = []
     for req_data in requests:
-        # Generate unique task ID using UUID
-        task_id = str(uuid.uuid4())
+        # Use Ma_Don_Hang from the request data as task ID
+        # Extract from the nested structure: data.data[0].master.maDonHang
+        try:
+            task_id = req_data["data"]["data"][0]["master"]["maDonHang"]
+        except (KeyError, IndexError, TypeError):
+            # If Ma_Don_Hang is not available, generate a fallback ID
+            # You might want to handle this differently based on your requirements
+            raise ValueError("Ma_Don_Hang is required for task identification")
+
         request = HttpRequest(
             url=req_data["url"], data=req_data["data"], task_id=task_id
         )
