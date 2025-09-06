@@ -34,7 +34,7 @@ class HttpResponse(BaseModel):
 
 class TaskStatus(BaseModel):
     task_id: str
-    status: str  # "pending", "running", "completed", "failed", "needs_retry"
+    detail: str  # Changed from "status" to "detail"
     response: Optional[HttpResponse] = None
     retry_count: int = 0
 
@@ -50,13 +50,15 @@ async def execute_request(
     """Execute a single HTTP request with error handling and auto-retry"""
 
     # Get current task status with proper type hint
-    task_status = await ctx.get("status", type_hint=TaskStatus) or TaskStatus(
-        task_id=request.task_id, status="pending", retry_count=0
+    task_status = await ctx.get(
+        "detail", type_hint=TaskStatus
+    ) or TaskStatus(  # Changed key from "status" to "detail"
+        task_id=request.task_id, detail="pending", retry_count=0
     )
 
     # Update status to running
-    task_status.status = "running"
-    ctx.set("status", task_status)
+    task_status.detail = "running"
+    ctx.set("detail", task_status)  # Changed key from "status" to "detail"
 
     async def make_http_request():
         try:
@@ -112,16 +114,36 @@ async def execute_request(
         "http_request", make_http_request, RunOptions(type_hint=HttpResponse)
     )
 
+    # Store API error as a simple string containing only the errorCode
+    if response.response_data and response.response_data.get("errorCode"):
+        error_code = response.response_data.get("errorCode")
+        # Ensure proper UTF-8 encoding
+        if isinstance(error_code, str):
+            # Decode any escaped Unicode sequences
+            try:
+                error_code = (
+                    error_code.encode("utf-8")
+                    .decode("unicode_escape")
+                    .encode("latin1")
+                    .decode("utf-8")
+                )
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                # If decoding fails, use the original string
+                pass
+        ctx.set("status", error_code)
+    elif response.success:
+        # Clear any previous error details on success
+        ctx.clear("status")  # Changed from "api_error" to "status"
+
     # Handle response based on success/failure
     if response.needs_manual_retry:
         # Increment retry count
         task_status.retry_count += 1
-        task_status.status = "needs_retry"
+        task_status.detail = "needs_retry"
         task_status.response = response
-        ctx.set("status", task_status)
+        ctx.set("detail", task_status)  # Changed key from "status" to "detail"
 
         # Schedule automatic retry after delay (exponential backoff)
-
         retry_delay = min(
             300, 5 * (2 ** min(task_status.retry_count, 6))
         )  # Max 5 minutes
@@ -146,14 +168,16 @@ async def retry_task(ctx: ObjectContext, request: HttpRequest) -> HttpResponse:
     """Manually retry a failed task"""
 
     # Get current task status with proper type hint
-    task_status = await ctx.get("status", type_hint=TaskStatus)
+    task_status = await ctx.get(
+        "detail", type_hint=TaskStatus
+    )  # Changed key from "status" to "detail"
     if not task_status:
         raise TerminalError(f"Task {request.task_id} not found")
 
     # Increment retry count
     task_status.retry_count += 1
-    task_status.status = "running"
-    ctx.set("status", task_status)
+    task_status.detail = "running"
+    ctx.set("detail", task_status)  # Changed key from "status" to "detail"
 
     # Re-execute the request
     return await execute_request(ctx, request)
@@ -162,7 +186,15 @@ async def retry_task(ctx: ObjectContext, request: HttpRequest) -> HttpResponse:
 @http_task.handler()
 async def get_task_status(ctx: ObjectContext) -> Optional[TaskStatus]:
     """Get the current status of a task"""
-    return await ctx.get("status", type_hint=TaskStatus)
+    return await ctx.get(
+        "detail", type_hint=TaskStatus
+    )  # Changed key from "status" to "detail"
+
+
+@http_task.handler()
+async def get_status(ctx: ObjectContext) -> Optional[str]:
+    """Get the API error status (errorCode) for a task"""
+    return await ctx.get("status")  # This now gets the errorCode string
 
 
 # Service for batch management
