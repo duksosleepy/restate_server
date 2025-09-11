@@ -1,8 +1,11 @@
 import asyncio
+import os
+import re
 from datetime import timedelta
 from typing import Any, Dict, Optional
 
 import httpx
+from dotenv import load_dotenv
 from pydantic import BaseModel
 from restate import (
     Context,
@@ -13,6 +16,9 @@ from restate import (
     app,
 )
 from restate.exceptions import TerminalError
+
+# Load environment variables
+load_dotenv()
 
 
 # Data models
@@ -41,6 +47,8 @@ class TaskStatus(BaseModel):
 
 # Virtual Object for managing individual HTTP request tasks
 http_task = VirtualObject("HttpTask")
+
+non_existing_codes = []
 
 
 @http_task.handler()
@@ -114,9 +122,22 @@ async def execute_request(
         "http_request", make_http_request, RunOptions(type_hint=HttpResponse)
     )
 
-    # Store API error as a simple string containing only the errorCode
-    if response.response_data and response.response_data.get("errorCode"):
+    # Store API error and extract product codes only when task fails and needs retry
+    if (
+        response.response_data
+        and response.response_data.get("errorCode")
+        and response.needs_manual_retry
+    ):
         error_code = response.response_data.get("errorCode")
+
+        # Extract and append product codes to list only when task fails and needs retry
+        if isinstance(error_code, str):
+            pattern = r"Mã hàng\s+([^\s]+(?:\s+[^\s]+)*?)\s+không tồn tại trong hệ thống"
+            matches = re.findall(pattern, error_code)
+
+            if matches and matches not in non_existing_codes:
+                non_existing_codes.extend(matches)
+
         # Ensure proper UTF-8 encoding
         if isinstance(error_code, str):
             # Decode any escaped Unicode sequences
@@ -200,10 +221,83 @@ async def get_status(ctx: ObjectContext) -> Optional[str]:
 # Service for batch management
 batch_service = Service("BatchService")
 
+# Global variables for email timing
+email_scheduler_active = False
+first_submit_time = None
+
+
+async def send_non_existing_codes_email(codes: list) -> None:
+    """Send email with the list of existing codes"""
+    try:
+        import smtplib
+        from datetime import datetime
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        # Email configuration from environment variables
+        smtp_server = os.getenv("SMTP_SERVER")
+        smtp_port = int(os.getenv("SMTP_PORT"))
+        email_address = os.getenv("EMAIL_ADDRESS")
+        email_password = os.getenv("EMAIL_PASSWORD")
+        recipients = os.getenv(
+            "EMAIL_RECIPIENTS", "nam.nguyen@lug.vn,songkhoi123@gmail.com"
+        )
+
+        # Create message
+        msg = MIMEMultipart()
+        msg["From"] = email_address
+        msg["To"] = recipients
+        msg["Subject"] = (
+            f"MÃ ĐƠN HÀNG CÒN THIẾU - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+
+        # Create email body
+        if codes:
+            codes_list = "\n".join([f"- {code}" for code in codes])
+            body = f"""
+                Thời gian xử lý: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+                Tổng số mã hàng không tồn tại trong hệ thống: {len(codes)}
+
+                Danh sách mã hàng:
+                {codes_list}
+
+                            """
+        msg.attach(MIMEText(body, "plain"))
+
+        # Send email
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(email_address, email_password)
+        server.sendmail(
+            email_address,
+            recipients.split(","),
+            msg.as_string(),
+        )
+        server.quit()
+
+        non_existing_codes.clear()
+
+        print(f"Email sent successfully with {len(codes)} existing codes")
+
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
 
 @batch_service.handler()
 async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     """Submit a batch of HTTP requests as individual tasks"""
+    global email_scheduler_active, first_submit_time
+
+    # Set first submit time and start email scheduler if not already active
+    if not email_scheduler_active:
+        first_submit_time = asyncio.get_event_loop().time()
+        email_scheduler_active = True
+
+        # Schedule single email after 10 minutes
+        ctx.service_send(
+            send_single_email, {}, send_delay=timedelta(minutes=10)
+        )
 
     task_ids = []
     for req_data in requests:
@@ -225,6 +319,39 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         task_ids.append(task_id)
 
     return {"message": f"Submitted {len(task_ids)} tasks", "task_ids": task_ids}
+
+
+@batch_service.handler()
+async def send_single_email(ctx: Context) -> Dict[str, str]:
+    """Send a single email with existing codes"""
+    global non_existing_codes, email_scheduler_active
+
+    if non_existing_codes:
+        # Send email with current codes
+        codes_to_send = non_existing_codes.copy()
+        await send_non_existing_codes_email(codes_to_send)
+
+        # Stop the email scheduler after sending
+        email_scheduler_active = False
+
+        return {
+            "message": f"Email sent with {len(codes_to_send)} codes, scheduler stopped"
+        }
+    else:
+        # No codes to send, stop the email scheduler
+        email_scheduler_active = False
+        return {"message": "No codes to send, email scheduler stopped"}
+
+
+@batch_service.handler()
+async def stop_email_scheduler(ctx: Context) -> Dict[str, str]:
+    """Stop the email scheduler"""
+    global email_scheduler_active, first_submit_time
+
+    email_scheduler_active = False
+    first_submit_time = None
+
+    return {"message": "Email scheduler stopped"}
 
 
 application = app(services=[batch_service, http_task])
