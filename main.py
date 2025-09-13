@@ -362,5 +362,6 @@ if __name__ == "__main__":
 
     config = hypercorn.config.Config()
     config.bind = ["0.0.0.0:9080"]
+    config.alpn_protocols = ["http/1.1"]
 
     asyncio.run(hypercorn.asyncio.serve(application, config))
