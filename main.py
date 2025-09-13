@@ -5,6 +5,7 @@ from datetime import timedelta
 from typing import Any, Dict, Optional
 
 import httpx
+import pandas as pd
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from restate import (
@@ -135,8 +136,10 @@ async def execute_request(
             pattern = r"Mã hàng\s+([^\s]+(?:\s+[^\s]+)*?)\s+không tồn tại trong hệ thống"
             matches = re.findall(pattern, error_code)
 
-            if matches and matches not in non_existing_codes:
-                non_existing_codes.extend(matches)
+            # Add only unique codes to prevent duplicates
+            for code in matches:
+                if code not in non_existing_codes:
+                    non_existing_codes.append(code)
 
         # Ensure proper UTF-8 encoding
         if isinstance(error_code, str):
@@ -226,13 +229,72 @@ email_scheduler_active = False
 first_submit_time = None
 
 
+def generate_excel_file(codes: list) -> str:
+    """Generate Excel file with non-existing codes and return filename"""
+    from datetime import datetime
+    from openpyxl.styles import Font, PatternFill, Border, Side
+    
+    # Create DataFrame with codes
+    df = pd.DataFrame({
+        'Product Code': codes,
+        'Status': ['Not Found'] * len(codes),
+        'Detected At': [datetime.now().strftime('%Y-%m-%d %H:%M:%S')] * len(codes),
+        'Action Required': ['Verify & Add to System'] * len(codes)
+    })
+    
+    # Generate filename with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    filename = f'non_existing_codes_{timestamp}.xlsx'
+    
+    # Create Excel file with formatting
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Non-Existing Codes', index=False)
+        
+        # Get workbook and worksheet objects for openpyxl
+        workbook = writer.book
+        worksheet = writer.sheets['Non-Existing Codes']
+        
+        # Define styles
+        header_font = Font(bold=True)
+        header_fill = PatternFill(start_color="D7E4BC", end_color="D7E4BC", fill_type="solid")
+        border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+        
+        # Format header row
+        for col in range(1, len(df.columns) + 1):
+            cell = worksheet.cell(row=1, column=col)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.border = border
+        
+        # Format data cells and add borders
+        for row in range(2, len(df) + 2):
+            for col in range(1, len(df.columns) + 1):
+                cell = worksheet.cell(row=row, column=col)
+                cell.border = border
+        
+        # Adjust column widths
+        worksheet.column_dimensions['A'].width = 15  # Product Code
+        worksheet.column_dimensions['B'].width = 12  # Status
+        worksheet.column_dimensions['C'].width = 20  # Detected At
+        worksheet.column_dimensions['D'].width = 25  # Action Required
+    
+    return filename
+
+
 async def send_non_existing_codes_email(codes: list) -> None:
-    """Send email with the list of existing codes"""
+    """Send email with the list of existing codes and Excel attachment"""
     try:
         import smtplib
         from datetime import datetime
         from email.mime.multipart import MIMEMultipart
         from email.mime.text import MIMEText
+        from email.mime.base import MIMEBase
+        from email import encoders
 
         # Email configuration from environment variables
         smtp_server = os.getenv("SMTP_SERVER")
@@ -242,6 +304,9 @@ async def send_non_existing_codes_email(codes: list) -> None:
         recipients = os.getenv(
             "EMAIL_RECIPIENTS", "nam.nguyen@lug.vn,songkhoi123@gmail.com"
         )
+
+        # Generate Excel file
+        excel_filename = generate_excel_file(codes)
 
         # Create message
         msg = MIMEMultipart()
@@ -253,17 +318,28 @@ async def send_non_existing_codes_email(codes: list) -> None:
 
         # Create email body
         if codes:
-            codes_list = "\n".join([f"- {code}" for code in codes])
             body = f"""
                 Thời gian xử lý: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
                 Tổng số mã hàng không tồn tại trong hệ thống: {len(codes)}
 
-                Danh sách mã hàng:
-                {codes_list}
+                Chi tiết danh sách mã hàng được đính kèm trong file Excel.
 
+                Vui lòng kiểm tra file đính kèm để xem danh sách đầy đủ.
                             """
         msg.attach(MIMEText(body, "plain"))
+
+        # Attach Excel file
+        with open(excel_filename, "rb") as attachment:
+            part = MIMEBase('application', 'octet-stream')
+            part.set_payload(attachment.read())
+        
+        encoders.encode_base64(part)
+        part.add_header(
+            'Content-Disposition',
+            f'attachment; filename= {excel_filename}',
+        )
+        msg.attach(part)
 
         # Send email
         server = smtplib.SMTP(smtp_server, smtp_port)
@@ -278,10 +354,23 @@ async def send_non_existing_codes_email(codes: list) -> None:
 
         non_existing_codes.clear()
 
-        print(f"Email sent successfully with {len(codes)} existing codes")
+        # Clean up Excel file after sending
+        try:
+            os.remove(excel_filename)
+        except FileNotFoundError:
+            pass
+
+        print(f"Email sent successfully with {len(codes)} existing codes and Excel attachment")
 
     except Exception as e:
         print(f"Failed to send email: {e}")
+        # Clean up Excel file if email fails
+        try:
+            excel_filename = f'non_existing_codes_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+            if os.path.exists(excel_filename):
+                os.remove(excel_filename)
+        except:
+            pass
 
 
 @batch_service.handler()
