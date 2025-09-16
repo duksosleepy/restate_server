@@ -1,9 +1,10 @@
 import asyncio
 import os
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
+import duckdb
 import httpx
 import pandas as pd
 from dotenv import load_dotenv
@@ -42,6 +43,106 @@ class HttpResponse(BaseModel):
 http_task = VirtualObject("HttpTask")
 
 non_existing_codes = []
+
+
+async def log_failed_order_to_db(
+    ctx: ObjectContext,
+    request: HttpRequest,
+    response: HttpResponse,
+    db_path: str = "orders.db",
+) -> None:
+    """Log failed order information to DuckDB database"""
+
+    def insert_or_update_order():
+        # Extract order data from the request
+        try:
+            order_data = request.data["data"][0]["master"]
+            details = request.data["data"][0].get("detail", [{}])[0]
+        except (KeyError, IndexError):
+            # Fallback if structure is different
+            order_data = {}
+            details = {}
+
+        conn = duckdb.connect(db_path)
+
+        # Check if record exists
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE order_id = ?", (request.task_id,)
+        )
+        exists = cursor.fetchone()[0] > 0
+
+        if exists:
+            # Update existing record
+            conn.execute(
+                """
+                UPDATE orders
+                SET error_code = ?, updated_at = ?, status = 'needs_retry'
+                WHERE order_id = ?
+            """,
+                (
+                    response.response_data.get("errorCode", response.error),
+                    datetime.now().isoformat(),
+                    request.task_id,
+                ),
+            )
+        else:
+            # Insert new record
+            conn.execute(
+                """
+                INSERT INTO orders (
+                    order_id, customer_name, phone_number, document_type, document_number,
+                    department_code, order_date, province, district, ward, address,
+                    product_code, product_name, imei, quantity, revenue, source_type,
+                    status, error_code, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    request.task_id,  # order_id (Ma_Don_Hang)
+                    order_data.get("tenKhachHang"),  # customer_name
+                    order_data.get("soDienThoai"),  # phone_number
+                    order_data.get("maCT"),  # document_type
+                    order_data.get("soCT"),  # document_number
+                    order_data.get("maBoPhan"),  # department_code
+                    order_data.get("ngayCT"),  # order_date
+                    order_data.get("tinhThanh"),  # province
+                    order_data.get("quanHuyen"),  # district
+                    order_data.get("phuongXa"),  # ward
+                    order_data.get("diaChi"),  # address
+                    details.get("maHang"),  # product_code
+                    details.get("tenHang"),  # product_name
+                    details.get("imei"),  # imei
+                    details.get("soLuong"),  # quantity
+                    details.get("doanhThu"),  # revenue
+                    order_data.get("sourceType", "online"),  # source_type
+                    "needs_retry",  # status
+                    response.response_data.get(
+                        "errorCode", response.error
+                    ),  # error_code
+                    datetime.now().isoformat(),  # updated_at
+                ),
+            )
+
+        conn.close()
+
+        return f"Logged failed order {request.task_id} to database"
+
+    # Execute database operation durably using Restate's run_typed
+    await ctx.run_typed("log_failed_order", insert_or_update_order)
+
+
+async def delete_successful_order_from_db(
+    ctx: ObjectContext, task_id: str, db_path: str = "orders.db"
+) -> None:
+    """Delete successful order from database"""
+
+    def delete_order():
+        conn = duckdb.connect(db_path)
+        conn.execute("DELETE FROM orders WHERE order_id = ?", (task_id,))
+        conn.close()
+        return f"Deleted successful order {task_id} from database"
+
+    # Execute database operation durably using Restate's run_typed
+    await ctx.run_typed("delete_successful_order", delete_order)
 
 
 @http_task.handler()
@@ -104,46 +205,44 @@ async def execute_request(
         "http_request", make_http_request, RunOptions(type_hint=HttpResponse)
     )
 
-    # Store API error and extract product codes only when task fails and needs retry
-    if (
-        response.response_data
-        and response.response_data.get("errorCode")
-        and response.needs_manual_retry
-    ):
-        error_code = response.response_data.get("errorCode")
+    # Handle success case - delete from database
+    if response.success:
+        await delete_successful_order_from_db(ctx, request.task_id)
+        return response
 
-        # Extract and append product codes to list only when task fails and needs retry
-        if isinstance(error_code, str):
-            pattern = r"Mã hàng\s+([^\s]+(?:\s+[^\s]+)*?)\s+không tồn tại trong hệ thống"
-            matches = re.findall(pattern, error_code)
-
-            # Add only unique codes to prevent duplicates
-            for code in matches:
-                if code not in non_existing_codes:
-                    non_existing_codes.append(code)
-
-        # Ensure proper UTF-8 encoding
-        if isinstance(error_code, str):
-            # Decode any escaped Unicode sequences
-            try:
-                error_code = (
-                    error_code.encode("utf-8")
-                    .decode("unicode_escape")
-                    .encode("latin1")
-                    .decode("utf-8")
-                )
-            except (UnicodeDecodeError, UnicodeEncodeError):
-                # If decoding fails, use the original string
-                pass
-
-    # Handle response based on success/failure
+    # Handle failure case - log to database and schedule retry
     if response.needs_manual_retry:
-        # Schedule automatic retry after delay (exponential backoff)
-        retry_delay = min(
-            300, 5 * (2**6)
-        )  # Max 5 minutes, simplified retry logic
+        # Store API error and extract product codes
+        if response.response_data and response.response_data.get("errorCode"):
+            error_code = response.response_data.get("errorCode")
 
-        # Schedule retry using delayed self-invocation
+            # Extract and append product codes to list
+            if isinstance(error_code, str):
+                pattern = r"Mã hàng\s+([^\s]+(?:\s+[^\s]+)*?)\s+không tồn tại trong hệ thống"
+                matches = re.findall(pattern, error_code)
+
+                # Add only unique codes to prevent duplicates
+                for code in matches:
+                    if code not in non_existing_codes:
+                        non_existing_codes.append(code)
+
+            # Ensure proper UTF-8 encoding
+            if isinstance(error_code, str):
+                try:
+                    error_code = (
+                        error_code.encode("utf-8")
+                        .decode("unicode_escape")
+                        .encode("latin1")
+                        .decode("utf-8")
+                    )
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    pass
+
+        # Log failed order to database
+        await log_failed_order_to_db(ctx, request, response)
+
+        # Schedule automatic retry after delay
+        retry_delay = min(300, 5 * (2**6))
         ctx.object_send(
             execute_request,
             ctx.key(),
@@ -164,8 +263,6 @@ first_submit_time = None
 
 def generate_excel_file(codes: list) -> str:
     """Generate Excel file with non-existing codes and return filename"""
-    from datetime import datetime
-
     from openpyxl.styles import Border, Font, PatternFill, Side
 
     # Create DataFrame with codes
@@ -229,7 +326,6 @@ async def send_non_existing_codes_email(codes: list) -> None:
     """Send email with the list of existing codes and Excel attachment"""
     try:
         import smtplib
-        from datetime import datetime
         from email import encoders
         from email.mime.base import MIMEBase
         from email.mime.multipart import MIMEMultipart
@@ -252,7 +348,7 @@ async def send_non_existing_codes_email(codes: list) -> None:
         msg["From"] = email_address
         msg["To"] = recipients
         msg["Subject"] = (
-            f"MÃ ĐƠN HÀNG CÒN THIẾU - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            f"MÃ ĐƠN HÀNG CÒ N THIẾU - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         )
 
         # Create email body
