@@ -14,24 +14,25 @@ CREATE TABLE orders (
     product_name VARCHAR, -- Ten_Hang
     imei VARCHAR,
     quantity INTEGER, -- So_Luong
-    revenue REAL, -- Doanh_Thu
+    revenue DECIMAL(15,2), -- Doanh_Thu
     source_type VARCHAR CHECK (source_type IN ('online', 'offline')),
     status VARCHAR DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'needs_retry', 'completed')),
     error_code VARCHAR, -- API errorCode response
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    -- PRIMARY KEY(order_id) -- Uncomment if order_id is unique
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
 );
+
 
 CREATE TABLE non_existing_codes (
     product_code VARCHAR PRIMARY KEY,
-    detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    detected_at TIMESTAMP DEFAULT NOW(),
     order_id VARCHAR
 );
 
--- Indexes
 CREATE INDEX idx_orders_order_id ON orders(order_id);
 CREATE INDEX idx_orders_status ON orders(status);
 CREATE INDEX idx_orders_created_at ON orders(created_at);
+-- Index for the new identification method (maDonHang, maHang, imei)
 CREATE INDEX idx_orders_identifiers ON orders(order_id, product_code, imei);
+-- Index for non-existing codes
 CREATE INDEX idx_non_existing_codes_product_code ON non_existing_codes(product_code);

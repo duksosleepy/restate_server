@@ -10,10 +10,13 @@ dependencies = [
     "fastapi>=0.116.1",
     "httpx>=0.28.1",
     "hypercorn>=0.17.3",
+    "libsql>=0.1.11",
+    "libsql-experimental>=0.0.55",
     "openpyxl>=3.1.5",
     "pandas>=2.3.2",
     "pydantic>=2.11.7",
     "python-dotenv>=1.1.1",
+    "pyturso>=0.1.5",
     "restate-sdk[serde]>=0.8.1",
     "uvicorn>=0.35.0",
 ]

@@ -2,11 +2,11 @@ import asyncio
 import logging
 import os
 import re
+import sqlite3
 from datetime import datetime, timedelta
 from threading import Lock
 from typing import Any, Dict, Optional
 
-import duckdb
 import httpx
 import pandas as pd
 from dotenv import load_dotenv
@@ -33,9 +33,80 @@ logging.basicConfig(
 # Create a logger for database operations
 db_logger = logging.getLogger("database_operations")
 
-# Shared DuckDB connection and lock for thread safety
-duckdb_con = duckdb.connect("orders.db")
-duckdb_lock = Lock()
+# Database configuration
+DB_PATH = "orders.db"
+sqlite_lock = Lock()
+
+
+class DatabaseManager:
+    """Thread-safe SQLite3 database manager with connection pooling"""
+
+    def __init__(self, db_path: str, max_connections: int = 10):
+        self.db_path = db_path
+        self.max_connections = max_connections
+        self._connections = []
+        self._lock = Lock()
+        self._initialize_database()
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get a database connection from the pool or create new one"""
+        with self._lock:
+            if self._connections:
+                return self._connections.pop()
+            else:
+                conn = sqlite3.connect(
+                    self.db_path, timeout=30.0, check_same_thread=False
+                )
+                # Enable WAL mode for better concurrency
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=OFF")
+                conn.execute("PRAGMA cache_size=10000")
+                conn.execute("PRAGMA temp_store=MEMORY")
+                return conn
+
+    def _return_connection(self, conn: sqlite3.Connection):
+        """Return a connection to the pool"""
+        with self._lock:
+            if len(self._connections) < self.max_connections:
+                self._connections.append(conn)
+            else:
+                conn.close()
+
+    def _initialize_database(self):
+        """Initialize database tables if they don't exist"""
+        with self.execute_query() as conn:
+            # Create orders table
+            conn.execute("select(1);")
+
+            conn.commit()
+
+    def execute_query(self):
+        """Context manager for database operations"""
+        return DatabaseConnection(self)
+
+
+class DatabaseConnection:
+    """Context manager for database connections"""
+
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+        self.conn = None
+
+    def __enter__(self) -> sqlite3.Connection:
+        self.conn = self.db_manager._get_connection()
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            if exc_type is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+            self.db_manager._return_connection(self.conn)
+
+
+# Initialize database manager
+db_manager = DatabaseManager(DB_PATH)
 
 
 # Data models
@@ -66,12 +137,18 @@ def query_from_thread(query_func, *args):
     db_logger.info(
         f"Executing database query with function: {query_func.__name__}"
     )
-    with duckdb_lock:
-        result = query_func(*args)
-        db_logger.info(
-            f"Database query completed successfully: {query_func.__name__}"
-        )
-        return result
+    with sqlite_lock:
+        try:
+            result = query_func(*args)
+            db_logger.info(
+                f"Database query completed successfully: {query_func.__name__}"
+            )
+            return result
+        except Exception as e:
+            db_logger.error(
+                f"Database query failed for {query_func.__name__}: {str(e)}"
+            )
+            raise
 
 
 def insert_non_existing_code_thread(product_code: str, order_id: str):
@@ -80,33 +157,35 @@ def insert_non_existing_code_thread(product_code: str, order_id: str):
         f"Inserting non-existing code {product_code} for order {order_id}"
     )
 
-    # Check if the code already exists in the database
-    cursor = duckdb_con.execute(
-        "SELECT COUNT(*) FROM non_existing_codes WHERE product_code = ?",
-        (product_code,),
-    )
-    exists = cursor.fetchone()[0] > 0
-
-    # Only insert if it doesn't already exist
-    if not exists:
-        duckdb_con.execute(
-            """
-            INSERT INTO non_existing_codes (product_code, order_id)
-            VALUES (?, ?)
+    try:
+        with db_manager.execute_query() as conn:
+            # Use INSERT OR IGNORE to handle duplicates gracefully
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO non_existing_codes (product_code, order_id)
+                VALUES (?, ?)
             """,
-            (product_code, order_id),
+                (product_code, order_id),
+            )
+
+            # Check if the insert was successful
+            if conn.total_changes > 0:
+                db_logger.info(
+                    f"Inserted non-existing code {product_code} for order {order_id}"
+                )
+            else:
+                db_logger.info(
+                    f"Non-existing code {product_code} already exists in database"
+                )
+    except Exception as e:
+        db_logger.error(
+            f"Error inserting non-existing code {product_code}: {str(e)}"
         )
-        db_logger.info(
-            f"Inserted non-existing code {product_code} for order {order_id}"
-        )
-    else:
-        db_logger.info(
-            f"Non-existing code {product_code} already exists in database"
-        )
+        raise
 
 
 def insert_order_thread(request: HttpRequest, response: HttpResponse):
-    """Thread function to insert new order in database (unless exact duplicate exists)"""
+    """Thread function to insert new order in database"""
     db_logger.info(
         f"Starting insert_order_thread for task_id: {request.task_id}"
     )
@@ -119,51 +198,55 @@ def insert_order_thread(request: HttpRequest, response: HttpResponse):
         order_data = {}
         details = {}
 
-    # Insert new record
-    db_logger.info(f"Inserting new order for task_id: {request.task_id}")
-    duckdb_con.execute(
-        """
-        INSERT INTO orders (
-            order_id, customer_name, phone_number, document_type, document_number,
-            department_code, order_date, province, district, ward, address,
-            product_code, product_name, imei, quantity, revenue, source_type,
-            status, error_code, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
-        (
-            request.task_id,  # order_id (Ma_Don_Hang)
-            order_data.get("tenKhachHang"),  # customer_name
-            order_data.get("soDienThoai"),  # phone_number
-            order_data.get("maCT"),  # document_type
-            order_data.get("soCT"),  # document_number
-            order_data.get("maBoPhan"),  # department_code
-            order_data.get("ngayCT"),  # order_date
-            order_data.get("tinhThanh"),  # province
-            order_data.get("quanHuyen"),  # district
-            order_data.get("phuongXa"),  # ward
-            order_data.get("diaChi"),  # address
-            details.get("maHang"),  # product_code
-            details.get("tenHang"),  # product_name
-            details.get("imei"),  # imei
-            details.get("soLuong"),  # quantity
-            details.get("doanhThu"),  # revenue
-            order_data.get("sourceType", "online"),  # source_type
-            "needs_retry",  # status
-            response.response_data.get(
-                "errorCode", response.error
-            ),  # error_code
-            datetime.now().isoformat(),  # updated_at
-        ),
-    )
+    try:
+        with db_manager.execute_query() as conn:
+            # Use INSERT OR REPLACE to handle duplicates
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO orders (
+                    order_id, customer_name, phone_number, document_type, document_number,
+                    department_code, order_date, province, district, ward, address,
+                    product_code, product_name, imei, quantity, revenue, source_type,
+                    status, error_code, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    request.task_id,  # order_id
+                    order_data.get("tenKhachHang"),  # customer_name
+                    order_data.get("soDienThoai"),  # phone_number
+                    order_data.get("maCT"),  # document_type
+                    order_data.get("soCT"),  # document_number
+                    order_data.get("maBoPhan"),  # department_code
+                    order_data.get("ngayCT"),  # order_date
+                    order_data.get("tinhThanh"),  # province
+                    order_data.get("quanHuyen"),  # district
+                    order_data.get("phuongXa"),  # ward
+                    order_data.get("diaChi"),  # address
+                    details.get("maHang"),  # product_code
+                    details.get("tenHang"),  # product_name
+                    details.get("imei"),  # imei
+                    details.get("soLuong"),  # quantity
+                    details.get("doanhThu"),  # revenue
+                    order_data.get("sourceType", "online"),  # source_type
+                    "needs_retry",  # status
+                    response.response_data.get(
+                        "errorCode", response.error
+                    ),  # error_code
+                    datetime.now().isoformat(),  # updated_at
+                ),
+            )
 
-    db_logger.info(
-        f"Completed insert_order_thread for task_id: {request.task_id}"
-    )
-    return f"Inserted new order {request.task_id} to database"
+        db_logger.info(
+            f"Completed insert_order_thread for task_id: {request.task_id}"
+        )
+        return f"Inserted new order {request.task_id} to database"
+    except Exception as e:
+        db_logger.error(f"Error inserting order {request.task_id}: {str(e)}")
+        raise
 
 
 def update_order_thread(request: HttpRequest, response: HttpResponse):
-    """Thread function to update existing order based on maDonHang, maHang, and imei"""
+    """Thread function to update existing order based on order_id, product_code, and imei"""
     db_logger.info(
         f"Starting update_order_thread for task_id: {request.task_id}"
     )
@@ -176,75 +259,79 @@ def update_order_thread(request: HttpRequest, response: HttpResponse):
         order_data = {}
         details = {}
 
-    # Update existing record based on maDonHang, maHang, and imei
-    db_logger.info(f"Updating existing order for task_id: {request.task_id}")
-    duckdb_con.execute(
-        """
-        UPDATE orders
-        SET
-            customer_name = ?,
-            phone_number = ?,
-            document_type = ?,
-            document_number = ?,
-            department_code = ?,
-            order_date = ?,
-            province = ?,
-            district = ?,
-            ward = ?,
-            address = ?,
-            product_code = ?,
-            product_name = ?,
-            imei = ?,
-            quantity = ?,
-            revenue = ?,
-            source_type = ?,
-            error_code = ?,
-            updated_at = ?,
-            status = 'needs_retry'
-        WHERE order_id = ? AND product_code = ? AND imei = ?
-    """,
-        (
-            order_data.get("tenKhachHang"),  # customer_name
-            order_data.get("soDienThoai"),  # phone_number
-            order_data.get("maCT"),  # document_type
-            order_data.get("soCT"),  # document_number
-            order_data.get("maBoPhan"),  # department_code
-            order_data.get("ngayCT"),  # order_date
-            order_data.get("tinhThanh"),  # province
-            order_data.get("quanHuyen"),  # district
-            order_data.get("phuongXa"),  # ward
-            order_data.get("diaChi"),  # address
-            details.get("maHang"),  # product_code
-            details.get("tenHang"),  # product_name
-            details.get("imei"),  # imei
-            details.get("soLuong"),  # quantity
-            details.get("doanhThu"),  # revenue
-            order_data.get("sourceType", "online"),  # source_type
-            response.response_data.get(
-                "errorCode", response.error
-            ),  # error_code
-            datetime.now().isoformat(),  # updated_at
-            request.task_id,  # WHERE order_id (maDonHang)
-            details.get("maHang"),  # WHERE product_code (maHang)
-            details.get("imei"),  # WHERE imei
-        ),
-    )
+    try:
+        with db_manager.execute_query() as conn:
+            # Update existing record
+            conn.execute(
+                """
+                UPDATE orders
+                SET
+                    customer_name = ?,
+                    phone_number = ?,
+                    document_type = ?,
+                    document_number = ?,
+                    department_code = ?,
+                    order_date = ?,
+                    province = ?,
+                    district = ?,
+                    ward = ?,
+                    address = ?,
+                    product_code = ?,
+                    product_name = ?,
+                    imei = ?,
+                    quantity = ?,
+                    revenue = ?,
+                    source_type = ?,
+                    error_code = ?,
+                    updated_at = ?,
+                    status = 'needs_retry'
+                WHERE order_id = ? AND product_code = ? AND imei = ?
+            """,
+                (
+                    order_data.get("tenKhachHang"),  # customer_name
+                    order_data.get("soDienThoai"),  # phone_number
+                    order_data.get("maCT"),  # document_type
+                    order_data.get("soCT"),  # document_number
+                    order_data.get("maBoPhan"),  # department_code
+                    order_data.get("ngayCT"),  # order_date
+                    order_data.get("tinhThanh"),  # province
+                    order_data.get("quanHuyen"),  # district
+                    order_data.get("phuongXa"),  # ward
+                    order_data.get("diaChi"),  # address
+                    details.get("maHang"),  # product_code
+                    details.get("tenHang"),  # product_name
+                    details.get("imei"),  # imei
+                    details.get("soLuong"),  # quantity
+                    details.get("doanhThu"),  # revenue
+                    order_data.get("sourceType", "online"),  # source_type
+                    response.response_data.get(
+                        "errorCode", response.error
+                    ),  # error_code
+                    datetime.now().isoformat(),  # updated_at
+                    request.task_id,  # WHERE order_id
+                    details.get("maHang"),  # WHERE product_code
+                    details.get("imei"),  # WHERE imei
+                ),
+            )
 
-    db_logger.info(
-        f"Completed update_order_thread for task_id: {request.task_id}"
-    )
-    return f"Updated existing order {request.task_id} in database"
+        db_logger.info(
+            f"Completed update_order_thread for task_id: {request.task_id}"
+        )
+        return f"Updated existing order {request.task_id} in database"
+    except Exception as e:
+        db_logger.error(f"Error updating order {request.task_id}: {str(e)}")
+        raise
 
 
 def handle_order_database_operation(
     request: HttpRequest, response: HttpResponse
 ):
-    """Determine whether to insert or update based on maDonHang, maHang, and imei"""
+    """Determine whether to insert or update based on order_id, product_code, and imei"""
     db_logger.info(
         f"Starting handle_order_database_operation for task_id: {request.task_id}"
     )
 
-    # Extract maHang and imei from request
+    # Extract product_code and imei from request
     try:
         details = request.data["data"][0].get("detail", [{}])[0]
         current_product_code = details.get("maHang")
@@ -253,49 +340,67 @@ def handle_order_database_operation(
         current_product_code = None
         current_imei = None
 
-    # Check if record exists with same maDonHang, maHang, and imei
-    cursor = duckdb_con.execute(
-        "SELECT COUNT(*) FROM orders WHERE order_id = ? AND product_code = ? AND imei = ?",
-        (request.task_id, current_product_code, current_imei),
-    )
-    exists_with_same_identifiers = cursor.fetchone()[0] > 0
+    try:
+        with db_manager.execute_query() as conn:
+            # Check if record exists with same order_id, product_code, and imei
+            cursor = conn.execute(
+                """
+                SELECT COUNT(*) FROM orders
+                WHERE order_id = ? AND product_code = ? AND imei = ?
+            """,
+                (request.task_id, current_product_code, current_imei),
+            )
 
-    if exists_with_same_identifiers:
-        # Update existing record with same maDonHang, maHang, and imei
-        return update_order_thread(request, response)
-    else:
-        # No existing record with same maDonHang, maHang, and imei, insert new
-        return insert_order_thread(request, response)
+            exists_with_same_identifiers = cursor.fetchone()[0] > 0
+
+        if exists_with_same_identifiers:
+            # Update existing record
+            return update_order_thread(request, response)
+        else:
+            # Insert new record
+            return insert_order_thread(request, response)
+    except Exception as e:
+        db_logger.error(
+            f"Error in handle_order_database_operation for {request.task_id}: {str(e)}"
+        )
+        raise
 
 
 def delete_order_thread(task_id: str, request: HttpRequest = None):
-    """Thread function to delete successful order from database (all records with same order_id)"""
+    """Thread function to delete successful order from database"""
     db_logger.info(f"Starting delete_order_thread for task_id: {task_id}")
-    duckdb_con.execute("DELETE FROM orders WHERE order_id = ?", (task_id,))
 
-    # If request data is available, also delete the product code from non_existing_codes table
-    if request:
-        try:
-            details = request.data["data"][0].get("detail", [{}])[0]
-            product_code = details.get("maHang")
-            if product_code:
-                db_logger.info(
-                    f"Deleting product code {product_code} from non_existing_codes table"
-                )
-                duckdb_con.execute(
-                    "DELETE FROM non_existing_codes WHERE product_code = ?",
-                    (product_code,),
-                )
-                db_logger.info(
-                    f"Deleted product code {product_code} from non_existing_codes table"
-                )
-        except (KeyError, IndexError) as e:
-            db_logger.warning(
-                f"Could not extract product code from request for task_id {task_id}: {e}"
-            )
+    try:
+        with db_manager.execute_query() as conn:
+            # Delete from orders table
+            conn.execute("DELETE FROM orders WHERE order_id = ?", (task_id,))
 
-    db_logger.info(f"Completed delete_order_thread for task_id: {task_id}")
-    return f"Deleted successful order {task_id} from database"
+            # If request data is available, also delete from non_existing_codes table
+            if request:
+                try:
+                    details = request.data["data"][0].get("detail", [{}])[0]
+                    product_code = details.get("maHang")
+                    if product_code:
+                        db_logger.info(
+                            f"Deleting product code {product_code} from non_existing_codes table"
+                        )
+                        conn.execute(
+                            "DELETE FROM non_existing_codes WHERE product_code = ?",
+                            (product_code,),
+                        )
+                        db_logger.info(
+                            f"Deleted product code {product_code} from non_existing_codes table"
+                        )
+                except (KeyError, IndexError) as e:
+                    db_logger.warning(
+                        f"Could not extract product code from request for task_id {task_id}: {e}"
+                    )
+
+        db_logger.info(f"Completed delete_order_thread for task_id: {task_id}")
+        return f"Deleted successful order {task_id} from database"
+    except Exception as e:
+        db_logger.error(f"Error deleting order {task_id}: {str(e)}")
+        raise
 
 
 async def log_failed_order_to_db(
@@ -304,7 +409,7 @@ async def log_failed_order_to_db(
     response: HttpResponse,
     db_path: str = "orders.db",
 ) -> None:
-    """Log failed order information to DuckDB database"""
+    """Log failed order information to SQLite database"""
 
     # Execute database operation durably using Restate's run_typed
     result = await ctx.run_typed(
@@ -408,14 +513,14 @@ async def execute_request(
                 pattern = r"Mã hàng\s+([^\s]+(?:\s+[^\s]+)*?)\s+không tồn tại trong hệ thống"
                 matches = re.findall(pattern, error_code)
 
-                # Add codes to both database (permanent storage) and in-memory list (for current batch)
+                # Add codes to both database and in-memory list
                 for code in matches:
                     # Add to database (will be unique due to UNIQUE constraint)
                     query_from_thread(
                         insert_non_existing_code_thread, code, request.task_id
                     )
 
-                    # Add to in-memory list for current email batch (if not already there)
+                    # Add to in-memory list for current email batch
                     if code not in non_existing_codes:
                         non_existing_codes.append(code)
 
@@ -554,7 +659,7 @@ async def send_non_existing_codes_email(codes: list) -> None:
                 Chi tiết danh sách mã hàng được đính kèm trong file Excel.
 
                 Vui lòng kiểm tra file đính kèm để xem danh sách đầy đủ.
-                            """
+            """
         msg.attach(MIMEText(body, "plain"))
 
         # Attach Excel file
@@ -613,25 +718,22 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         first_submit_time = asyncio.get_event_loop().time()
         email_scheduler_active = True
 
-        # Schedule single email after 10 minutes
+        # Schedule single email after 5 minutes
         ctx.service_send(send_single_email, {}, send_delay=timedelta(minutes=5))
 
     task_ids = []
     for req_data in requests:
         # Use Ma_Don_Hang from the request data as task ID
-        # Extract from the nested structure: data.data[0].master.maDonHang
         try:
             task_id = req_data["data"]["data"][0]["master"]["maDonHang"]
         except (KeyError, IndexError, TypeError):
-            # If Ma_Don_Hang is not available, generate a fallback ID
-            # You might want to handle this differently based on your requirements
             raise ValueError("Ma_Don_Hang is required for task identification")
 
         request = HttpRequest(
             url=req_data["url"], data=req_data["data"], task_id=task_id
         )
 
-        # Submit each request as a separate task (fire and forget)
+        # Submit each request as a separate task
         ctx.object_send(execute_request, task_id, request)
         task_ids.append(task_id)
 
