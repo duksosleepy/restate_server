@@ -2,12 +2,13 @@ import asyncio
 import logging
 import os
 import re
+import sqlite3
 from datetime import datetime, timedelta
+from threading import Lock
 from typing import Any, Dict, Optional
 
 import httpx
 import pandas as pd
-import turso  # Changed from sqlite3
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from restate import (
@@ -33,133 +34,82 @@ logging.basicConfig(
 db_logger = logging.getLogger("database_operations")
 
 # Database configuration
-DB_PATH = "orders.db"  # Turso will handle this differently if using cloud
-# For Turso cloud, you might use: DB_URL = os.getenv("TURSO_DB_URL")
+DB_PATH = "orders.db"
+sqlite_lock = Lock()
 
 
-class TursoDatabaseManager:
-    """
-    Turso database manager with simplified connection handling.
-    Turso handles connection pooling and thread safety internally.
-    """
+class DatabaseManager:
+    """Thread-safe SQLite3 database manager with connection pooling"""
 
-    def __init__(self, db_path: str):
-        """
-        Initialize Turso database manager.
-
-        Args:
-            db_path: Path to database file or Turso connection URL
-        """
+    def __init__(self, db_path: str, max_connections: int = 10):
         self.db_path = db_path
+        self.max_connections = max_connections
+        self._connections = []
+        self._lock = Lock()
         self._initialize_database()
 
-    def get_connection(self):
-        """
-        Get a Turso database connection.
-        Turso handles connection pooling internally.
-        """
-        # For local file
-        conn = turso.connect(self.db_path)
+    def _get_connection(self) -> sqlite3.Connection:
+        """Get a database connection from the pool or create new one"""
+        with self._lock:
+            if self._connections:
+                return self._connections.pop()
+            else:
+                conn = sqlite3.connect(
+                    self.db_path, timeout=30.0, check_same_thread=False
+                )
+                # Enable WAL mode for better concurrency
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=OFF")
+                conn.execute("PRAGMA cache_size=10000")
+                conn.execute("PRAGMA temp_store=MEMORY")
+                return conn
 
-        # For Turso cloud (if using):
-        # conn = turso.connect(
-        #     self.db_path,
-        #     auth_token=os.getenv("TURSO_AUTH_TOKEN")
-        # )
-
-        # Apply optimizations (Turso may handle some internally)
-        cursor = conn.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=OFF")
-        cursor.execute("PRAGMA cache_size=10000")
-        conn.commit()
-
-        return conn
+    def _return_connection(self, conn: sqlite3.Connection):
+        """Return a connection to the pool"""
+        with self._lock:
+            if len(self._connections) < self.max_connections:
+                self._connections.append(conn)
+            else:
+                conn.close()
 
     def _initialize_database(self):
         """Initialize database tables if they don't exist"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-
-        try:
-            # Create orders table with your exact schema
-            cursor.execute("select(1);")
+        with self.execute_query() as conn:
+            # Create orders table
+            conn.execute("select(1);")
 
             conn.commit()
-            db_logger.info("Database tables initialized successfully")
 
-        except Exception as e:
-            db_logger.error(f"Error initializing database: {str(e)}")
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+    def execute_query(self):
+        """Context manager for database operations"""
+        return DatabaseConnection(self)
 
-    def execute_query(self, query: str, params: tuple = None):
-        """
-        Execute a query with automatic connection management.
 
-        Args:
-            query: SQL query to execute
-            params: Query parameters
+class DatabaseConnection:
+    """Context manager for database connections"""
 
-        Returns:
-            Query results for SELECT, affected rows for INSERT/UPDATE/DELETE
-        """
-        conn = self.get_connection()
-        cursor = conn.cursor()
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+        self.conn = None
 
-        try:
-            if params:
-                cursor.execute(query, params)
+    def __enter__(self) -> sqlite3.Connection:
+        self.conn = self.db_manager._get_connection()
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            if exc_type is None:
+                self.conn.commit()
             else:
-                cursor.execute(query)
-
-            # Handle different query types
-            if query.strip().upper().startswith("SELECT"):
-                result = cursor.fetchall()
-            else:
-                conn.commit()
-                result = cursor.rowcount
-
-            return result
-
-        except Exception as e:
-            conn.rollback()
-            db_logger.error(f"Query execution failed: {str(e)}")
-            raise
-        finally:
-            conn.close()
-
-    def execute_with_connection(self, func, *args, **kwargs):
-        """
-        Execute a function with a database connection.
-
-        Args:
-            func: Function to execute that takes connection as first argument
-            *args, **kwargs: Additional arguments for the function
-
-        Returns:
-            Function result
-        """
-        conn = self.get_connection()
-        try:
-            result = func(conn, *args, **kwargs)
-            conn.commit()
-            return result
-        except Exception as e:
-            conn.rollback()
-            db_logger.error(f"Function execution failed: {str(e)}")
-            raise
-        finally:
-            conn.close()
+                self.conn.rollback()
+            self.db_manager._return_connection(self.conn)
 
 
-# Initialize Turso database manager
-db_manager = TursoDatabaseManager(DB_PATH)
+# Initialize database manager
+db_manager = DatabaseManager(DB_PATH)
 
 
-# Data models (unchanged)
+# Data models
 class HttpRequest(BaseModel):
     url: str
     data: Dict[str, Any]
@@ -182,47 +132,100 @@ http_task = VirtualObject("HttpTask")
 non_existing_codes = []
 
 
-def insert_non_existing_code(product_code: str, order_id: str):
-    """
-    Insert or update non-existing product code in database using Turso.
-    Note: product_code is PRIMARY KEY in the schema.
-    """
+def query_from_thread(query_func, *args):
+    """Execute a database query in a thread-safe manner"""
+    db_logger.info(
+        f"Executing database query with function: {query_func.__name__}"
+    )
+    with sqlite_lock:
+        try:
+            result = query_func(*args)
+            db_logger.info(
+                f"Database query completed successfully: {query_func.__name__}"
+            )
+            return result
+        except Exception as e:
+            db_logger.error(
+                f"Database query failed for {query_func.__name__}: {str(e)}"
+            )
+            raise
+
+
+def update_daily_stats_thread(
+    task_completed: bool = False, task_failed: bool = False
+):
+    """Thread function to update daily task statistics"""
+    today = datetime.now().date().isoformat()
+
+    try:
+        with db_manager.execute_query() as conn:
+            # Insert or update daily stats
+            if task_completed:
+                conn.execute(
+                    """
+                    INSERT INTO daily_task_stats (stat_date, completed_tasks, failed_tasks, last_updated)
+                    VALUES (?, 1, 0, ?)
+                    ON CONFLICT(stat_date) DO UPDATE SET
+                        completed_tasks = completed_tasks + 1,
+                        last_updated = ?
+                """,
+                    (
+                        today,
+                        datetime.now().isoformat(),
+                        datetime.now().isoformat(),
+                    ),
+                )
+
+            if task_failed:
+                conn.execute(
+                    """
+                    INSERT INTO daily_task_stats (stat_date, completed_tasks, failed_tasks, last_updated)
+                    VALUES (?, 0, 1, ?)
+                    ON CONFLICT(stat_date) DO UPDATE SET
+                        failed_tasks = failed_tasks + 1,
+                        last_updated = ?
+                """,
+                    (
+                        today,
+                        datetime.now().isoformat(),
+                        datetime.now().isoformat(),
+                    ),
+                )
+
+        db_logger.info(
+            f"Updated daily stats - completed: {task_completed}, failed: {task_failed}"
+        )
+    except Exception as e:
+        db_logger.error(f"Error updating daily stats: {str(e)}")
+        raise
+
+
+def insert_non_existing_code_thread(product_code: str, order_id: str):
+    """Thread function to insert non-existing product code into database"""
     db_logger.info(
         f"Inserting non-existing code {product_code} for order {order_id}"
     )
 
     try:
-        # First check if the product_code already exists
-        check_query = """
-            SELECT COUNT(*) FROM non_existing_codes
-            WHERE product_code = ?
-        """
-        result = db_manager.execute_query(check_query, (product_code,))
-
-        if result[0][0] == 0:
-            # Product code doesn't exist, insert it
-            insert_query = """
-                INSERT INTO non_existing_codes (product_code, order_id)
+        with db_manager.execute_query() as conn:
+            # Use INSERT OR IGNORE to handle duplicates gracefully
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO non_existing_codes (product_code, order_id)
                 VALUES (?, ?)
-            """
-            db_manager.execute_query(insert_query, (product_code, order_id))
-            db_logger.info(
-                f"Inserted non-existing code {product_code} for order {order_id}"
+            """,
+                (product_code, order_id),
             )
-            return 1
-        else:
-            # Product code exists, optionally update the order_id if needed
-            update_query = """
-                UPDATE non_existing_codes
-                SET order_id = ?, detected_at = CURRENT_TIMESTAMP
-                WHERE product_code = ?
-            """
-            db_manager.execute_query(update_query, (order_id, product_code))
-            db_logger.info(
-                f"Updated non-existing code {product_code} with new order {order_id}"
-            )
-            return 0
 
+            # Check if the insert was successful
+            if conn.total_changes > 0:
+                db_logger.info(
+                    f"Inserted non-existing code {product_code} for order {order_id}"
+                )
+            else:
+                db_logger.info(
+                    f"Non-existing code {product_code} already exists in database"
+                )
     except Exception as e:
         db_logger.error(
             f"Error inserting non-existing code {product_code}: {str(e)}"
@@ -230,9 +233,11 @@ def insert_non_existing_code(product_code: str, order_id: str):
         raise
 
 
-def insert_order(request: HttpRequest, response: HttpResponse):
-    """Insert new order in database using Turso"""
-    db_logger.info(f"Starting insert_order for task_id: {request.task_id}")
+def insert_order_thread(request: HttpRequest, response: HttpResponse):
+    """Thread function to insert new order in database"""
+    db_logger.info(
+        f"Starting insert_order_thread for task_id: {request.task_id}"
+    )
 
     # Extract order data from the request
     try:
@@ -242,109 +247,58 @@ def insert_order(request: HttpRequest, response: HttpResponse):
         order_data = {}
         details = {}
 
-    # Validate source_type
-    source_type = order_data.get("sourceType", "online")
-    if source_type not in ["online", "offline"]:
-        source_type = "online"  # Default to online if invalid
-
     try:
-        # First check if the record exists (based on order_id, product_code, imei)
-        check_query = """
-            SELECT COUNT(*) FROM orders
-            WHERE order_id = ? AND product_code = ? AND imei = ?
-        """
-        check_params = (
-            request.task_id,
-            details.get("maHang"),
-            details.get("imei"),
-        )
-
-        result = db_manager.execute_query(check_query, check_params)
-
-        if result[0][0] > 0:
-            # Record exists, update it
-            update_query = """
-                UPDATE orders SET
-                    customer_name = ?, phone_number = ?, document_type = ?,
-                    document_number = ?, department_code = ?, order_date = ?,
-                    province = ?, district = ?, ward = ?, address = ?,
-                    product_name = ?, quantity = ?, revenue = ?,
-                    source_type = ?, status = ?, error_code = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE order_id = ? AND product_code = ? AND imei = ?
-            """
-            update_params = (
-                order_data.get("tenKhachHang"),
-                order_data.get("soDienThoai"),
-                order_data.get("maCT"),
-                order_data.get("soCT"),
-                order_data.get("maBoPhan"),
-                order_data.get("ngayCT"),  # Should be DATE format
-                order_data.get("tinhThanh"),
-                order_data.get("quanHuyen"),
-                order_data.get("phuongXa"),
-                order_data.get("diaChi"),
-                details.get("tenHang"),
-                details.get("soLuong"),
-                details.get("doanhThu"),
-                source_type,
-                "needs_retry",
-                response.response_data.get("errorCode", response.error),
-                # WHERE clause params
-                request.task_id,
-                details.get("maHang"),
-                details.get("imei"),
-            )
-            db_manager.execute_query(update_query, update_params)
-            db_logger.info(
-                f"Updated existing order {request.task_id} in database"
-            )
-        else:
-            # Record doesn't exist, insert it
-            insert_query = """
-                INSERT INTO orders (
+        with db_manager.execute_query() as conn:
+            # Use INSERT OR REPLACE to handle duplicates
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO orders (
                     order_id, customer_name, phone_number, document_type, document_number,
                     department_code, order_date, province, district, ward, address,
                     product_code, product_name, imei, quantity, revenue, source_type,
-                    status, error_code, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-            """
-            insert_params = (
-                request.task_id,  # order_id
-                order_data.get("tenKhachHang"),  # customer_name
-                order_data.get("soDienThoai"),  # phone_number
-                order_data.get("maCT"),  # document_type
-                order_data.get("soCT"),  # document_number
-                order_data.get("maBoPhan"),  # department_code
-                order_data.get("ngayCT"),  # order_date (should be DATE format)
-                order_data.get("tinhThanh"),  # province
-                order_data.get("quanHuyen"),  # district
-                order_data.get("phuongXa"),  # ward
-                order_data.get("diaChi"),  # address
-                details.get("maHang"),  # product_code
-                details.get("tenHang"),  # product_name
-                details.get("imei"),  # imei
-                details.get("soLuong"),  # quantity
-                details.get("doanhThu"),  # revenue
-                source_type,  # source_type
-                "needs_retry",  # status
-                response.response_data.get(
-                    "errorCode", response.error
-                ),  # error_code
+                    status, error_code, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    request.task_id,  # order_id
+                    order_data.get("tenKhachHang"),  # customer_name
+                    order_data.get("soDienThoai"),  # phone_number
+                    order_data.get("maCT"),  # document_type
+                    order_data.get("soCT"),  # document_number
+                    order_data.get("maBoPhan"),  # department_code
+                    order_data.get("ngayCT"),  # order_date
+                    order_data.get("tinhThanh"),  # province
+                    order_data.get("quanHuyen"),  # district
+                    order_data.get("phuongXa"),  # ward
+                    order_data.get("diaChi"),  # address
+                    details.get("maHang"),  # product_code
+                    details.get("tenHang"),  # product_name
+                    details.get("imei"),  # imei
+                    details.get("soLuong"),  # quantity
+                    details.get("doanhThu"),  # revenue
+                    order_data.get("sourceType", "online"),  # source_type
+                    "needs_retry",  # status
+                    response.response_data.get(
+                        "errorCode", response.error
+                    ),  # error_code
+                    datetime.now().isoformat(),  # updated_at
+                ),
             )
-            db_manager.execute_query(insert_query, insert_params)
-            db_logger.info(f"Inserted new order {request.task_id} to database")
 
-        return f"Processed order {request.task_id} in database"
-
+        db_logger.info(
+            f"Completed insert_order_thread for task_id: {request.task_id}"
+        )
+        return f"Inserted new order {request.task_id} to database"
     except Exception as e:
-        db_logger.error(f"Error processing order {request.task_id}: {str(e)}")
+        db_logger.error(f"Error inserting order {request.task_id}: {str(e)}")
         raise
 
 
-def update_order(request: HttpRequest, response: HttpResponse):
-    """Update existing order based on order_id, product_code, and imei using Turso"""
-    db_logger.info(f"Starting update_order for task_id: {request.task_id}")
+def update_order_thread(request: HttpRequest, response: HttpResponse):
+    """Thread function to update existing order based on order_id, product_code, and imei"""
+    db_logger.info(
+        f"Starting update_order_thread for task_id: {request.task_id}"
+    )
 
     # Extract order data from the request
     try:
@@ -355,61 +309,64 @@ def update_order(request: HttpRequest, response: HttpResponse):
         details = {}
 
     try:
-        query = """
-            UPDATE orders
-            SET
-                customer_name = ?,
-                phone_number = ?,
-                document_type = ?,
-                document_number = ?,
-                department_code = ?,
-                order_date = ?,
-                province = ?,
-                district = ?,
-                ward = ?,
-                address = ?,
-                product_code = ?,
-                product_name = ?,
-                imei = ?,
-                quantity = ?,
-                revenue = ?,
-                source_type = ?,
-                error_code = ?,
-                updated_at = ?,
-                status = 'needs_retry'
-            WHERE order_id = ? AND product_code = ? AND imei = ?
-        """
+        with db_manager.execute_query() as conn:
+            # Update existing record
+            conn.execute(
+                """
+                UPDATE orders
+                SET
+                    customer_name = ?,
+                    phone_number = ?,
+                    document_type = ?,
+                    document_number = ?,
+                    department_code = ?,
+                    order_date = ?,
+                    province = ?,
+                    district = ?,
+                    ward = ?,
+                    address = ?,
+                    product_code = ?,
+                    product_name = ?,
+                    imei = ?,
+                    quantity = ?,
+                    revenue = ?,
+                    source_type = ?,
+                    error_code = ?,
+                    updated_at = ?,
+                    status = 'needs_retry'
+                WHERE order_id = ? AND product_code = ? AND imei = ?
+            """,
+                (
+                    order_data.get("tenKhachHang"),  # customer_name
+                    order_data.get("soDienThoai"),  # phone_number
+                    order_data.get("maCT"),  # document_type
+                    order_data.get("soCT"),  # document_number
+                    order_data.get("maBoPhan"),  # department_code
+                    order_data.get("ngayCT"),  # order_date
+                    order_data.get("tinhThanh"),  # province
+                    order_data.get("quanHuyen"),  # district
+                    order_data.get("phuongXa"),  # ward
+                    order_data.get("diaChi"),  # address
+                    details.get("maHang"),  # product_code
+                    details.get("tenHang"),  # product_name
+                    details.get("imei"),  # imei
+                    details.get("soLuong"),  # quantity
+                    details.get("doanhThu"),  # revenue
+                    order_data.get("sourceType", "online"),  # source_type
+                    response.response_data.get(
+                        "errorCode", response.error
+                    ),  # error_code
+                    datetime.now().isoformat(),  # updated_at
+                    request.task_id,  # WHERE order_id
+                    details.get("maHang"),  # WHERE product_code
+                    details.get("imei"),  # WHERE imei
+                ),
+            )
 
-        params = (
-            order_data.get("tenKhachHang"),  # customer_name
-            order_data.get("soDienThoai"),  # phone_number
-            order_data.get("maCT"),  # document_type
-            order_data.get("soCT"),  # document_number
-            order_data.get("maBoPhan"),  # department_code
-            order_data.get("ngayCT"),  # order_date
-            order_data.get("tinhThanh"),  # province
-            order_data.get("quanHuyen"),  # district
-            order_data.get("phuongXa"),  # ward
-            order_data.get("diaChi"),  # address
-            details.get("maHang"),  # product_code
-            details.get("tenHang"),  # product_name
-            details.get("imei"),  # imei
-            details.get("soLuong"),  # quantity
-            details.get("doanhThu"),  # revenue
-            order_data.get("sourceType", "online"),  # source_type
-            response.response_data.get(
-                "errorCode", response.error
-            ),  # error_code
-            datetime.now().isoformat(),  # updated_at
-            request.task_id,  # WHERE order_id
-            details.get("maHang"),  # WHERE product_code
-            details.get("imei"),  # WHERE imei
+        db_logger.info(
+            f"Completed update_order_thread for task_id: {request.task_id}"
         )
-
-        db_manager.execute_query(query, params)
-        db_logger.info(f"Completed update_order for task_id: {request.task_id}")
         return f"Updated existing order {request.task_id} in database"
-
     except Exception as e:
         db_logger.error(f"Error updating order {request.task_id}: {str(e)}")
         raise
@@ -433,24 +390,24 @@ def handle_order_database_operation(
         current_imei = None
 
     try:
-        # Check if record exists with same order_id, product_code, and imei
-        query = """
-            SELECT COUNT(*) FROM orders
-            WHERE order_id = ? AND product_code = ? AND imei = ?
-        """
-        result = db_manager.execute_query(
-            query, (request.task_id, current_product_code, current_imei)
-        )
+        with db_manager.execute_query() as conn:
+            # Check if record exists with same order_id, product_code, and imei
+            cursor = conn.execute(
+                """
+                SELECT COUNT(*) FROM orders
+                WHERE order_id = ? AND product_code = ? AND imei = ?
+            """,
+                (request.task_id, current_product_code, current_imei),
+            )
 
-        exists_with_same_identifiers = result[0][0] > 0 if result else False
+            exists_with_same_identifiers = cursor.fetchone()[0] > 0
 
         if exists_with_same_identifiers:
             # Update existing record
-            return update_order(request, response)
+            return update_order_thread(request, response)
         else:
             # Insert new record
-            return insert_order(request, response)
-
+            return insert_order_thread(request, response)
     except Exception as e:
         db_logger.error(
             f"Error in handle_order_database_operation for {request.task_id}: {str(e)}"
@@ -458,44 +415,37 @@ def handle_order_database_operation(
         raise
 
 
-def delete_order(task_id: str, request: HttpRequest = None):
-    """Delete successful order from database using Turso"""
-    db_logger.info(f"Starting delete_order for task_id: {task_id}")
-
-    def delete_operation(conn, task_id, request):
-        cursor = conn.cursor()
-
-        # Delete from orders table
-        cursor.execute("DELETE FROM orders WHERE order_id = ?", (task_id,))
-
-        # If request data is available, also delete from non_existing_codes table
-        if request:
-            try:
-                details = request.data["data"][0].get("detail", [{}])[0]
-                product_code = details.get("maHang")
-                if product_code:
-                    db_logger.info(
-                        f"Deleting product code {product_code} from non_existing_codes table"
-                    )
-                    cursor.execute(
-                        "DELETE FROM non_existing_codes WHERE product_code = ?",
-                        (product_code,),
-                    )
-                    db_logger.info(
-                        f"Deleted product code {product_code} from non_existing_codes table"
-                    )
-            except (KeyError, IndexError) as e:
-                db_logger.warning(
-                    f"Could not extract product code from request for task_id {task_id}: {e}"
-                )
-
-        return cursor.rowcount
+def delete_order_thread(task_id: str, request: HttpRequest = None):
+    """Thread function to delete successful order from database"""
+    db_logger.info(f"Starting delete_order_thread for task_id: {task_id}")
 
     try:
-        result = db_manager.execute_with_connection(
-            delete_operation, task_id, request
-        )
-        db_logger.info(f"Completed delete_order for task_id: {task_id}")
+        with db_manager.execute_query() as conn:
+            # Delete from orders table
+            conn.execute("DELETE FROM orders WHERE order_id = ?", (task_id,))
+
+            # If request data is available, also delete from non_existing_codes table
+            if request:
+                try:
+                    details = request.data["data"][0].get("detail", [{}])[0]
+                    product_code = details.get("maHang")
+                    if product_code:
+                        db_logger.info(
+                            f"Deleting product code {product_code} from non_existing_codes table"
+                        )
+                        conn.execute(
+                            "DELETE FROM non_existing_codes WHERE product_code = ?",
+                            (product_code,),
+                        )
+                        db_logger.info(
+                            f"Deleted product code {product_code} from non_existing_codes table"
+                        )
+                except (KeyError, IndexError) as e:
+                    db_logger.warning(
+                        f"Could not extract product code from request for task_id {task_id}: {e}"
+                    )
+
+        db_logger.info(f"Completed delete_order_thread for task_id: {task_id}")
         return f"Deleted successful order {task_id} from database"
     except Exception as e:
         db_logger.error(f"Error deleting order {task_id}: {str(e)}")
@@ -506,14 +456,16 @@ async def log_failed_order_to_db(
     ctx: ObjectContext,
     request: HttpRequest,
     response: HttpResponse,
+    db_path: str = "orders.db",
 ) -> None:
-    """Log failed order information to database"""
+    """Log failed order information to SQLite database"""
 
     # Execute database operation durably using Restate's run_typed
-    # No more need for query_from_thread wrapper
     result = await ctx.run_typed(
         "log_failed_order",
-        lambda: handle_order_database_operation(request, response),
+        lambda: query_from_thread(
+            handle_order_database_operation, request, response
+        ),
     )
     return result
 
@@ -522,14 +474,14 @@ async def delete_successful_order_from_db(
     ctx: ObjectContext,
     task_id: str,
     request: HttpRequest = None,
+    db_path: str = "orders.db",
 ) -> None:
     """Delete successful order from database"""
 
     # Execute database operation durably using Restate's run_typed
-    # No more need for query_from_thread wrapper
     result = await ctx.run_typed(
         "delete_successful_order",
-        lambda: delete_order(task_id, request),
+        lambda: query_from_thread(delete_order_thread, task_id, request),
     )
     return result
 
@@ -594,9 +546,16 @@ async def execute_request(
         "http_request", make_http_request, RunOptions(type_hint=HttpResponse)
     )
 
-    # Handle success case - delete from database
+    # Handle success case - delete from database and update stats
     if response.success:
         await delete_successful_order_from_db(ctx, request.task_id, request)
+        # Update daily stats for completed task
+        await ctx.run_typed(
+            "update_daily_stats_completed",
+            lambda: query_from_thread(
+                update_daily_stats_thread, task_completed=True
+            ),
+        )
         return response
 
     # Handle failure case - log to database and schedule retry
@@ -613,7 +572,9 @@ async def execute_request(
                 # Add codes to both database and in-memory list
                 for code in matches:
                     # Add to database (will be unique due to UNIQUE constraint)
-                    insert_non_existing_code(code, request.task_id)
+                    query_from_thread(
+                        insert_non_existing_code_thread, code, request.task_id
+                    )
 
                     # Add to in-memory list for current email batch
                     if code not in non_existing_codes:
@@ -633,6 +594,14 @@ async def execute_request(
 
         # Log failed order to database
         await log_failed_order_to_db(ctx, request, response)
+
+        # Update daily stats for failed task
+        await ctx.run_typed(
+            "update_daily_stats_failed",
+            lambda: query_from_thread(
+                update_daily_stats_thread, task_failed=True
+            ),
+        )
 
         # Schedule automatic retry after delay
         retry_delay = min(300, 5 * (2**6))

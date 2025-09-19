@@ -29,9 +29,18 @@ CREATE TABLE non_existing_codes (
     order_id VARCHAR
 );
 
+CREATE TABLE daily_task_stats (
+    stat_date DATE PRIMARY KEY,
+    completed_tasks INTEGER DEFAULT 0, -- Successfully processed orders
+    failed_tasks INTEGER DEFAULT 0,    -- Orders that need retry
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Indexes
 CREATE INDEX idx_orders_order_id ON orders(order_id);
 CREATE INDEX idx_orders_status ON orders(status);
 CREATE INDEX idx_orders_created_at ON orders(created_at);
 CREATE INDEX idx_orders_identifiers ON orders(order_id, product_code, imei);
 CREATE INDEX idx_non_existing_codes_product_code ON non_existing_codes(product_code);
+CREATE INDEX idx_daily_task_stats_date ON daily_task_stats(stat_date);
