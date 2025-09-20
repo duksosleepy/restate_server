@@ -553,7 +553,7 @@ async def execute_request(
         await ctx.run_typed(
             "update_daily_stats_completed",
             lambda: query_from_thread(
-                update_daily_stats_thread, task_completed=True
+                update_daily_stats_thread, True, False
             ),
         )
         return response
@@ -599,7 +599,7 @@ async def execute_request(
         await ctx.run_typed(
             "update_daily_stats_failed",
             lambda: query_from_thread(
-                update_daily_stats_thread, task_failed=True
+                update_daily_stats_thread, False, True
             ),
         )
 
