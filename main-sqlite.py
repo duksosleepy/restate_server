@@ -34,7 +34,7 @@ logging.basicConfig(
 db_logger = logging.getLogger("database_operations")
 
 # Database configuration
-DB_PATH = "orders.db"
+DB_PATH = os.getenv("DB_PATH", "orders.db")
 sqlite_lock = Lock()
 
 
@@ -552,9 +552,7 @@ async def execute_request(
         # Update daily stats for completed task
         await ctx.run_typed(
             "update_daily_stats_completed",
-            lambda: query_from_thread(
-                update_daily_stats_thread, True, False
-            ),
+            lambda: query_from_thread(update_daily_stats_thread, True, False),
         )
         return response
 
@@ -598,9 +596,7 @@ async def execute_request(
         # Update daily stats for failed task
         await ctx.run_typed(
             "update_daily_stats_failed",
-            lambda: query_from_thread(
-                update_daily_stats_thread, False, True
-            ),
+            lambda: query_from_thread(update_daily_stats_thread, False, True),
         )
 
         # Schedule automatic retry after delay
