@@ -247,6 +247,10 @@ def insert_order_thread(request: HttpRequest, response: HttpResponse):
         order_data = {}
         details = {}
 
+    # Determine source_type based on maDonHang
+    ma_don_hang = order_data.get("maDonHang", "")
+    source_type = "offline" if "/" in ma_don_hang else "online"
+
     try:
         with db_manager.execute_query() as conn:
             # Use INSERT OR REPLACE to handle duplicates
@@ -276,7 +280,7 @@ def insert_order_thread(request: HttpRequest, response: HttpResponse):
                     details.get("imei"),  # imei
                     details.get("soLuong"),  # quantity
                     details.get("doanhThu"),  # revenue
-                    order_data.get("sourceType", "online"),  # source_type
+                    source_type,  # source_type
                     "needs_retry",  # status
                     response.response_data.get(
                         "errorCode", response.error
@@ -307,6 +311,10 @@ def update_order_thread(request: HttpRequest, response: HttpResponse):
     except (KeyError, IndexError):
         order_data = {}
         details = {}
+
+    # Determine source_type based on maDonHang
+    ma_don_hang = order_data.get("maDonHang", "")
+    source_type = "offline" if "/" in ma_don_hang else "online"
 
     try:
         with db_manager.execute_query() as conn:
@@ -352,7 +360,7 @@ def update_order_thread(request: HttpRequest, response: HttpResponse):
                     details.get("imei"),  # imei
                     details.get("soLuong"),  # quantity
                     details.get("doanhThu"),  # revenue
-                    order_data.get("sourceType", "online"),  # source_type
+                    source_type,  # source_type
                     response.response_data.get(
                         "errorCode", response.error
                     ),  # error_code

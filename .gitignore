@@ -5,3 +5,4 @@ server.log
 *.xlsx
 orders.db-shm
 orders.db-wal
+*.csv
