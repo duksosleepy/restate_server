@@ -790,6 +790,8 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         ctx.service_send(send_single_email, {}, send_delay=timedelta(minutes=5))
 
     task_ids = []
+    errors = []  # Track errors
+
     for req_data in requests:
         # Use Ma_Don_Hang from the request data as task ID
         try:
@@ -801,11 +803,26 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
             url=req_data["url"], data=req_data["data"], task_id=task_id
         )
 
-        # Submit each request as a separate task
-        ctx.object_send(execute_request, task_id, request)
+        # Use object_call to wait for and see the response
+        response = await ctx.object_call(execute_request, task_id, request)
+
+        if not response.success:
+            errors.append(
+                {
+                    "task_id": task_id,
+                    "error": response.error,
+                    "status_code": response.status_code,
+                    "response_data": response.response_data,
+                }
+            )
+
         task_ids.append(task_id)
 
-    return {"message": f"Submitted {len(task_ids)} tasks", "task_ids": task_ids}
+    return {
+        "message": f"Submitted {len(task_ids)} tasks",
+        "task_ids": task_ids,
+        "errors": errors if errors else None,  # Include errors in response
+    }
 
 
 @batch_service.handler()
