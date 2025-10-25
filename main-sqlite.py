@@ -18,6 +18,7 @@ from restate import (
     Service,
     VirtualObject,
     app,
+    InvocationRetryPolicy
 )
 
 # Load environment variables
@@ -126,8 +127,17 @@ class HttpResponse(BaseModel):
     needs_manual_retry: bool = False
 
 
-# Virtual Object for managing individual HTTP request tasks
-http_task = VirtualObject("HttpTask")
+http_task = VirtualObject(
+    "HttpTask",
+    inactivity_timeout=timedelta(days=30),
+    invocation_retry_policy=InvocationRetryPolicy(
+        initial_interval=timedelta(minutes=15),
+        exponentiation_factor=2.0,
+        max_interval=None,  # No upper limit
+        max_attempts=None,  # Retry indefinitely
+        on_max_attempts=None
+    )
+)
 
 non_existing_codes = []
 
@@ -607,20 +617,11 @@ async def execute_request(
             lambda: query_from_thread(update_daily_stats_thread, False, True),
         )
 
-        # Schedule automatic retry after delay
-        retry_delay = min(300, 5 * (2**6))
-        ctx.object_send(
-            execute_request,
-            ctx.key(),
-            request,
-            send_delay=timedelta(seconds=retry_delay),
-        )
-
     return response
 
 
 # Service for batch management
-batch_service = Service("BatchService")
+batch_service = Service("BatchService", inactivity_timeout=timedelta(days=30))
 
 # Global variables for email timing
 email_scheduler_active = False
