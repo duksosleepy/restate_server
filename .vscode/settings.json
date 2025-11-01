@@ -2,5 +2,10 @@
     "debug.javascript.defaultRuntimeExecutable": {
         "pwa-node": "/home/duk/.local/share/mise/shims/node"
     },
-    "python.defaultInterpreterPath": "${workspaceFolder}/.venv"
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv",
+    "chat.mcp.serverSampling": {
+        "restate_server/.vscode/mcp.json: restate-mcp": {
+            "allowedModels": []
+        }
+    }
 }

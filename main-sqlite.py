@@ -11,10 +11,10 @@ import httpx
 import pandas as pd
 from dotenv import load_dotenv
 from pydantic import BaseModel
+import restate
 from restate import (
     Context,
     ObjectContext,
-    RunOptions,
     Service,
     VirtualObject,
     app,
@@ -504,7 +504,7 @@ async def delete_successful_order_from_db(
     return result
 
 
-@http_task.handler()
+@http_task.handler("execute_request")
 async def execute_request(
     ctx: ObjectContext, request: HttpRequest
 ) -> HttpResponse:
@@ -561,7 +561,7 @@ async def execute_request(
 
     # Execute the HTTP request durably
     response = await ctx.run_typed(
-        "http_request", make_http_request, RunOptions(type_hint=HttpResponse)
+        "http_request", make_http_request
     )
 
     # Handle success case - delete from database and update stats
@@ -580,24 +580,39 @@ async def execute_request(
         if response.response_data and response.response_data.get("errorCode"):
             error_code = response.response_data.get("errorCode")
 
-            # Extract and append product codes to list
+            # Only process if error_code is a string
             if isinstance(error_code, str):
+                # Check for duplicate document pattern first
+                duplicate_pattern = r"Chứng từ\s+.+?\s+đã nhập\."
+                if re.search(duplicate_pattern, error_code):
+                    # Delete the task instead of retrying
+                    await delete_successful_order_from_db(ctx, request.task_id, request)
+                    await ctx.run_typed(
+                        "update_daily_stats_completed",
+                        lambda: query_from_thread(update_daily_stats_thread, True, False),
+                    )
+                    return HttpResponse(
+                        task_id=request.task_id,
+                        url=request.url,
+                        status_code=response.status_code,
+                        response_data=response.response_data,
+                        success=True,
+                        error=f"Duplicate document detected and removed: {error_code}",
+                        needs_manual_retry=False,
+                    )
+
+                # Extract non-existing product codes
                 pattern = r"Mã hàng\s+([^\s]+(?:\s+[^\s]+)*?)\s+không tồn tại trong hệ thống"
                 matches = re.findall(pattern, error_code)
 
-                # Add codes to both database and in-memory list
                 for code in matches:
-                    # Add to database (will be unique due to UNIQUE constraint)
                     query_from_thread(
                         insert_non_existing_code_thread, code, request.task_id
                     )
-
-                    # Add to in-memory list for current email batch
                     if code not in non_existing_codes:
                         non_existing_codes.append(code)
 
-            # Ensure proper UTF-8 encoding
-            if isinstance(error_code, str):
+                # Ensure proper UTF-8 encoding
                 try:
                     error_code = (
                         error_code.encode("utf-8")
@@ -621,7 +636,7 @@ async def execute_request(
 
 
 # Service for batch management
-batch_service = Service("BatchService", inactivity_timeout=timedelta(days=30))
+batch_service = restate.Service("BatchService")
 
 # Global variables for email timing
 email_scheduler_active = False
@@ -777,22 +792,23 @@ async def send_non_existing_codes_email(codes: list) -> None:
             pass
 
 
-@batch_service.handler()
+@batch_service.handler("submit_batch")
 async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
-    """Submit a batch of HTTP requests as individual tasks"""
+    """Submit a batch of HTTP requests and wait for quick errors (5 second timeout)"""
     global email_scheduler_active, first_submit_time
+
+    task_ids = []
+    request_futures = []
 
     # Set first submit time and start email scheduler if not already active
     if not email_scheduler_active:
         first_submit_time = asyncio.get_event_loop().time()
         email_scheduler_active = True
 
-        # Schedule single email after 5 minutes
-        ctx.service_send(send_single_email, {}, send_delay=timedelta(minutes=5))
+        # Schedule single email after 5 minutes (fire-and-forget)
+        ctx.service_send(send_single_email, arg={}, send_delay=timedelta(minutes=5))
 
-    task_ids = []
-    errors = []  # Track errors
-
+    # Start all requests in parallel without blocking
     for req_data in requests:
         # Use Ma_Don_Hang from the request data as task ID
         try:
@@ -804,29 +820,60 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
             url=req_data["url"], data=req_data["data"], task_id=task_id
         )
 
-        # Use object_call to wait for and see the response
-        response = await ctx.object_call(execute_request, task_id, request)
-
-        if not response.success:
-            errors.append(
-                {
-                    "task_id": task_id,
-                    "error": response.error,
-                    "status_code": response.status_code,
-                    "response_data": response.response_data,
-                }
-            )
-
+        # Start request processing asynchronously (don't await yet)
+        future = ctx.object_call(execute_request, task_id, request)
+        request_futures.append((task_id, future))
         task_ids.append(task_id)
 
+    # Wait for quick errors with 5 second timeout
+    errors = []
+    timeout = timedelta(seconds=5)
+
+    try:
+        # Use select to wait with timeout
+        match await restate.select(
+            results=restate.gather(*[f for _, f in request_futures]),
+            timeout=ctx.sleep(timeout)
+        ):
+            case ["results", responses]:
+                # All completed within timeout - check for errors
+                for (task_id, _), response in zip(request_futures, responses):
+                    if not response.success:
+                        errors.append({
+                            "task_id": task_id,
+                            "error": response.error,
+                            "status_code": response.status_code,
+                            "response_data": response.response_data,
+                        })
+            case ["timeout", _]:
+                # Timeout occurred - some requests still processing in background
+                # Collect any responses that are available
+                for task_id, future in request_futures:
+                    try:
+                        response = await future
+                        if not response.success:
+                            errors.append({
+                                "task_id": task_id,
+                                "error": response.error,
+                                "status_code": response.status_code,
+                                "response_data": response.response_data,
+                            })
+                    except Exception:
+                        # Request still processing, will continue in background
+                        pass
+    except Exception as e:
+        db_logger.error(f"Error in batch submission timeout handling: {str(e)}")
+
+    # Return response with any immediate errors, rest continue in background
     return {
-        "message": f"Submitted {len(task_ids)} tasks",
+        "message": f"Submitted {len(task_ids)} tasks for processing",
         "task_ids": task_ids,
-        "errors": errors if errors else None,  # Include errors in response
+        "errors": errors if errors else None,
+        "info": "Remaining requests are being processed asynchronously in the background"
     }
 
 
-@batch_service.handler()
+@batch_service.handler("send_single_email")
 async def send_single_email(ctx: Context) -> Dict[str, str]:
     """Send a single email with existing codes"""
     global non_existing_codes, email_scheduler_active
@@ -851,7 +898,7 @@ async def send_single_email(ctx: Context) -> Dict[str, str]:
         return {"message": "No codes to send, email scheduler stopped"}
 
 
-@batch_service.handler()
+@batch_service.handler("stop_email_scheduler")
 async def stop_email_scheduler(ctx: Context) -> Dict[str, str]:
     """Stop the email scheduler"""
     global email_scheduler_active, first_submit_time
