@@ -538,7 +538,7 @@ async def execute_request(
                         success=False,
                         error=f"HTTP {response.status_code} error",
                         needs_manual_retry=True,
-                    )
+                    ).model_dump()
 
                 return HttpResponse(
                     task_id=request.task_id,
@@ -546,7 +546,7 @@ async def execute_request(
                     status_code=response.status_code,
                     response_data=response.json(),
                     success=True,
-                )
+                ).model_dump()
 
         except Exception as e:
             return HttpResponse(
@@ -557,12 +557,14 @@ async def execute_request(
                 success=False,
                 error=str(e),
                 needs_manual_retry=True,
-            )
+            ).model_dump()
 
     # Execute the HTTP request durably
-    response = await ctx.run_typed(
+    response_dict = await ctx.run_typed(
         "http_request", make_http_request
     )
+    # Convert dict back to HttpResponse object
+    response = HttpResponse(**response_dict)
 
     # Handle success case - delete from database and update stats
     if response.success:
