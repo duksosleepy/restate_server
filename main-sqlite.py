@@ -24,6 +24,35 @@ from restate import (
 # Load environment variables
 load_dotenv()
 
+"""
+RETENTION CONFIGURATION FOR BATCH INVOCATIONS:
+=============================================
+To enable 30-day retention for failed batch invocations, configure Restate with:
+
+In restate.toml or via environment variables:
+  [default-idempotency-retention]
+  retention-duration = "30days"
+
+Or via environment variable:
+  RESTATE_DEFAULT_IDEMPOTENCY_RETENTION__RETENTION_DURATION=30days
+
+This ensures:
+1. Failed batches (with any HttpTask failure) are retained for 30 days
+2. Successful batches (all HttpTasks succeed) are purged immediately
+3. The idempotency-key allows you to retry/attach to in-flight batches
+
+USAGE:
+======
+Call submit_batch with an idempotency key to enable retention management:
+
+  curl -X POST http://localhost:8080/BatchService/submit_batch \
+    -H "Idempotency-Key: batch-2024-11-07-001" \
+    -H "Content-Type: application/json" \
+    -d '{"requests": [...]}'
+
+The Idempotency-Key header automatically enables 30-day retention.
+"""
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -433,6 +462,43 @@ def handle_order_database_operation(
         raise
 
 
+def cleanup_old_failed_orders_thread(days: int = 30):
+    """Thread function to cleanup orders that failed for more than specified days"""
+    db_logger.info(f"Starting cleanup_old_failed_orders_thread for orders older than {days} days")
+
+    try:
+        with db_manager.execute_query() as conn:
+            # Calculate cutoff date (30 days ago)
+            cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+
+            # Get orders that will be deleted
+            cursor = conn.execute(
+                """
+                SELECT COUNT(*) FROM orders
+                WHERE status = 'needs_retry' AND updated_at < ?
+            """,
+                (cutoff_date,),
+            )
+            count = cursor.fetchone()[0]
+
+            # Delete orders older than retention period
+            conn.execute(
+                """
+                DELETE FROM orders
+                WHERE status = 'needs_retry' AND updated_at < ?
+            """,
+                (cutoff_date,),
+            )
+
+        db_logger.info(
+            f"Completed cleanup_old_failed_orders_thread - deleted {count} orders older than {days} days"
+        )
+        return f"Deleted {count} old failed orders from database"
+    except Exception as e:
+        db_logger.error(f"Error cleaning up old failed orders: {str(e)}")
+        raise
+
+
 def delete_order_thread(task_id: str, request: HttpRequest = None):
     """Thread function to delete successful order from database"""
     db_logger.info(f"Starting delete_order_thread for task_id: {task_id}")
@@ -502,6 +568,41 @@ async def delete_successful_order_from_db(
         lambda: query_from_thread(delete_order_thread, task_id, request),
     )
     return result
+
+
+def purge_batch_invocation(invocation_id: str) -> str:
+    """
+    Purge a batch invocation from Restate storage.
+    This removes the invocation metadata and journal when all tasks succeeded.
+
+    Args:
+        invocation_id: The ID of the batch invocation to purge
+
+    Returns:
+        Status message
+    """
+    import httpx
+    import json
+
+    try:
+        # Get Restate admin API endpoint from environment or use default
+        restate_admin_url = os.getenv("RESTATE_ADMIN_URL", "http://localhost:9070")
+        purge_url = f"{restate_admin_url}/invocations/{invocation_id}/purge"
+
+        # Use synchronous httpx client to purge the invocation
+        with httpx.Client() as client:
+            response = client.patch(purge_url)
+            if response.status_code in [200, 202, 204]:
+                db_logger.info(f"Successfully purged invocation {invocation_id}")
+                return f"Purged invocation {invocation_id}"
+            else:
+                db_logger.warning(
+                    f"Failed to purge invocation {invocation_id}: {response.status_code}"
+                )
+                return f"Failed to purge invocation {invocation_id}: {response.status_code}"
+    except Exception as e:
+        db_logger.error(f"Error purging invocation {invocation_id}: {str(e)}")
+        raise
 
 
 @http_task.handler("execute_request")
@@ -579,9 +680,10 @@ async def execute_request(
     # Handle failure case - log to database and schedule retry
     if response.needs_manual_retry:
         # Store API error and extract product codes
-        if response.response_data and response.response_data.get("errorCode"):
-            error_code = response.response_data.get("errorCode")
+        # Only process if errorCode exists (empty errorCode means success)
+        error_code = response.response_data.get("errorCode") if response.response_data else None
 
+        if error_code:  # Only process if errorCode is not empty/None
             # Only process if error_code is a string
             if isinstance(error_code, str):
                 # Check for duplicate document pattern first
@@ -625,8 +727,17 @@ async def execute_request(
                 except (UnicodeDecodeError, UnicodeEncodeError):
                     pass
 
-        # Log failed order to database
-        await log_failed_order_to_db(ctx, request, response)
+            # Log failed order to database
+            await log_failed_order_to_db(ctx, request, response)
+        else:
+            # Empty errorCode means successful HTTP request - treat as success
+            # Delete the successful order from database
+            await delete_successful_order_from_db(ctx, request.task_id, request)
+            await ctx.run_typed(
+                "update_daily_stats_completed",
+                lambda: query_from_thread(update_daily_stats_thread, True, False),
+            )
+            return response
 
         # Update daily stats for failed task
         await ctx.run_typed(
@@ -795,8 +906,20 @@ async def send_non_existing_codes_email(codes: list) -> None:
 
 
 @batch_service.handler("submit_batch")
-async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
-    """Submit a batch of HTTP requests and wait for quick errors (5 second timeout)"""
+async def submit_batch(ctx: Context, requests: list, idempotency_key: str = None) -> Dict[str, str]:
+    """
+    Submit a batch of HTTP requests and wait for quick errors (5 second timeout).
+
+    If all HttpTasks succeed, the invocation will be purged immediately.
+    If any HttpTask fails, the invocation will be retained for 30 days (idempotency key retention).
+
+    Args:
+        requests: List of HTTP request data
+        idempotency_key: Optional idempotency key for batch tracking (enables retention management)
+
+    Returns:
+        Status dict with task IDs and any immediate errors
+    """
     global email_scheduler_active, first_submit_time
 
     task_ids = []
@@ -830,6 +953,7 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     # Wait for quick errors with 5 second timeout
     errors = []
     timeout = timedelta(seconds=5)
+    all_responses = []
 
     try:
         # Use select to wait with timeout
@@ -839,6 +963,7 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         ):
             case ["results", responses]:
                 # All completed within timeout - check for errors
+                all_responses = responses
                 for (task_id, _), response in zip(request_futures, responses):
                     if not response.success:
                         errors.append({
@@ -853,6 +978,7 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
                 for task_id, future in request_futures:
                     try:
                         response = await future
+                        all_responses.append(response)
                         if not response.success:
                             errors.append({
                                 "task_id": task_id,
@@ -866,12 +992,31 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     except Exception as e:
         db_logger.error(f"Error in batch submission timeout handling: {str(e)}")
 
+    # If idempotency key is provided and all tasks succeeded, purge the invocation
+    if idempotency_key and not errors and len(all_responses) == len(request_futures):
+        # All tasks completed successfully - purge the invocation to free up disk space
+        try:
+            invocation_id = await ctx.invocation_id()
+            # Schedule purge operation to clean up invocation from Restate
+            await ctx.run_typed(
+                "purge_batch_invocation",
+                lambda: purge_batch_invocation(invocation_id),
+            )
+            db_logger.info(
+                f"Batch invocation {invocation_id} purged successfully (all tasks succeeded)"
+            )
+        except Exception as e:
+            db_logger.warning(
+                f"Could not purge batch invocation: {str(e)} (will be auto-purged after retention)"
+            )
+
     # Return response with any immediate errors, rest continue in background
     return {
         "message": f"Submitted {len(task_ids)} tasks for processing",
         "task_ids": task_ids,
         "errors": errors if errors else None,
-        "info": "Remaining requests are being processed asynchronously in the background"
+        "info": "Remaining requests are being processed asynchronously in the background",
+        "batch_status": "all_succeeded" if not errors and len(all_responses) == len(request_futures) else "some_failed_or_pending"
     }
 
 
@@ -909,6 +1054,28 @@ async def stop_email_scheduler(ctx: Context) -> Dict[str, str]:
     first_submit_time = None
 
     return {"message": "Email scheduler stopped"}
+
+
+@batch_service.handler("cleanup_old_failed_orders")
+async def cleanup_old_failed_orders(
+    ctx: Context, days: int = 30
+) -> Dict[str, str]:
+    """
+    Cleanup orders that have failed and are older than the retention period.
+    This handler should be called periodically (e.g., once per day) to clean up
+    old failed invocations that are no longer being retried.
+
+    Args:
+        days: Number of days to retain failed orders (default: 30)
+
+    Returns:
+        Status message with count of deleted orders
+    """
+    result = await ctx.run_typed(
+        "cleanup_failed_orders",
+        lambda: query_from_thread(cleanup_old_failed_orders_thread, days),
+    )
+    return {"message": result}
 
 
 application = app(services=[batch_service, http_task])

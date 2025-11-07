@@ -1,0 +1,2 @@
+tracing-filter = "info"
+default-journal-retention = "30d"
