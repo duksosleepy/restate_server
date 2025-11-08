@@ -9,49 +9,19 @@ from typing import Any, Dict, Optional
 
 import httpx
 import pandas as pd
+import restate
 from dotenv import load_dotenv
 from pydantic import BaseModel
-import restate
 from restate import (
     Context,
+    InvocationRetryPolicy,
     ObjectContext,
-    Service,
     VirtualObject,
     app,
-    InvocationRetryPolicy
 )
 
 # Load environment variables
 load_dotenv()
-
-"""
-RETENTION CONFIGURATION FOR BATCH INVOCATIONS:
-=============================================
-To enable 30-day retention for failed batch invocations, configure Restate with:
-
-In restate.toml or via environment variables:
-  [default-idempotency-retention]
-  retention-duration = "30days"
-
-Or via environment variable:
-  RESTATE_DEFAULT_IDEMPOTENCY_RETENTION__RETENTION_DURATION=30days
-
-This ensures:
-1. Failed batches (with any HttpTask failure) are retained for 30 days
-2. Successful batches (all HttpTasks succeed) are purged immediately
-3. The idempotency-key allows you to retry/attach to in-flight batches
-
-USAGE:
-======
-Call submit_batch with an idempotency key to enable retention management:
-
-  curl -X POST http://localhost:8080/BatchService/submit_batch \
-    -H "Idempotency-Key: batch-2024-11-07-001" \
-    -H "Content-Type: application/json" \
-    -d '{"requests": [...]}'
-
-The Idempotency-Key header automatically enables 30-day retention.
-"""
 
 # Configure logging
 logging.basicConfig(
@@ -162,10 +132,10 @@ http_task = VirtualObject(
     invocation_retry_policy=InvocationRetryPolicy(
         initial_interval=timedelta(minutes=15),
         exponentiation_factor=2.0,
-        max_interval=None,  # No upper limit
-        max_attempts=None,  # Retry indefinitely
-        on_max_attempts=None
-    )
+        max_interval=None,
+        max_attempts=None,
+        on_max_attempts=None,
+    ),
 )
 
 non_existing_codes = []
@@ -464,7 +434,9 @@ def handle_order_database_operation(
 
 def cleanup_old_failed_orders_thread(days: int = 30):
     """Thread function to cleanup orders that failed for more than specified days"""
-    db_logger.info(f"Starting cleanup_old_failed_orders_thread for orders older than {days} days")
+    db_logger.info(
+        f"Starting cleanup_old_failed_orders_thread for orders older than {days} days"
+    )
 
     try:
         with db_manager.execute_query() as conn:
@@ -581,19 +553,23 @@ def purge_batch_invocation(invocation_id: str) -> str:
     Returns:
         Status message
     """
+
     import httpx
-    import json
 
     try:
         # Get Restate admin API endpoint from environment or use default
-        restate_admin_url = os.getenv("RESTATE_ADMIN_URL", "http://localhost:9070")
+        restate_admin_url = os.getenv(
+            "RESTATE_ADMIN_URL", "http://localhost:9070"
+        )
         purge_url = f"{restate_admin_url}/invocations/{invocation_id}/purge"
 
         # Use synchronous httpx client to purge the invocation
         with httpx.Client() as client:
             response = client.patch(purge_url)
             if response.status_code in [200, 202, 204]:
-                db_logger.info(f"Successfully purged invocation {invocation_id}")
+                db_logger.info(
+                    f"Successfully purged invocation {invocation_id}"
+                )
                 return f"Purged invocation {invocation_id}"
             else:
                 db_logger.warning(
@@ -661,9 +637,7 @@ async def execute_request(
             ).model_dump()
 
     # Execute the HTTP request durably
-    response_dict = await ctx.run_typed(
-        "http_request", make_http_request
-    )
+    response_dict = await ctx.run_typed("http_request", make_http_request)
     # Convert dict back to HttpResponse object
     response = HttpResponse(**response_dict)
 
@@ -681,7 +655,11 @@ async def execute_request(
     if response.needs_manual_retry:
         # Store API error and extract product codes
         # Only process if errorCode exists (empty errorCode means success)
-        error_code = response.response_data.get("errorCode") if response.response_data else None
+        error_code = (
+            response.response_data.get("errorCode")
+            if response.response_data
+            else None
+        )
 
         if error_code:  # Only process if errorCode is not empty/None
             # Only process if error_code is a string
@@ -690,10 +668,14 @@ async def execute_request(
                 duplicate_pattern = r"Chứng từ\s+.+?\s+đã nhập\."
                 if re.search(duplicate_pattern, error_code):
                     # Delete the task instead of retrying
-                    await delete_successful_order_from_db(ctx, request.task_id, request)
+                    await delete_successful_order_from_db(
+                        ctx, request.task_id, request
+                    )
                     await ctx.run_typed(
                         "update_daily_stats_completed",
-                        lambda: query_from_thread(update_daily_stats_thread, True, False),
+                        lambda: query_from_thread(
+                            update_daily_stats_thread, True, False
+                        ),
                     )
                     return HttpResponse(
                         task_id=request.task_id,
@@ -735,7 +717,9 @@ async def execute_request(
             await delete_successful_order_from_db(ctx, request.task_id, request)
             await ctx.run_typed(
                 "update_daily_stats_completed",
-                lambda: query_from_thread(update_daily_stats_thread, True, False),
+                lambda: query_from_thread(
+                    update_daily_stats_thread, True, False
+                ),
             )
             return response
 
@@ -906,7 +890,9 @@ async def send_non_existing_codes_email(codes: list) -> None:
 
 
 @batch_service.handler("submit_batch")
-async def submit_batch(ctx: Context, requests: list, idempotency_key: str = None) -> Dict[str, str]:
+async def submit_batch(
+    ctx: Context, requests: list, idempotency_key: str = None
+) -> Dict[str, str]:
     """
     Submit a batch of HTTP requests and wait for quick errors (5 second timeout).
 
@@ -931,7 +917,9 @@ async def submit_batch(ctx: Context, requests: list, idempotency_key: str = None
         email_scheduler_active = True
 
         # Schedule single email after 5 minutes (fire-and-forget)
-        ctx.service_send(send_single_email, arg={}, send_delay=timedelta(minutes=5))
+        ctx.service_send(
+            send_single_email, arg={}, send_delay=timedelta(minutes=5)
+        )
 
     # Start all requests in parallel without blocking
     for req_data in requests:
@@ -959,19 +947,21 @@ async def submit_batch(ctx: Context, requests: list, idempotency_key: str = None
         # Use select to wait with timeout
         match await restate.select(
             results=restate.gather(*[f for _, f in request_futures]),
-            timeout=ctx.sleep(timeout)
+            timeout=ctx.sleep(timeout),
         ):
             case ["results", responses]:
                 # All completed within timeout - check for errors
                 all_responses = responses
                 for (task_id, _), response in zip(request_futures, responses):
                     if not response.success:
-                        errors.append({
-                            "task_id": task_id,
-                            "error": response.error,
-                            "status_code": response.status_code,
-                            "response_data": response.response_data,
-                        })
+                        errors.append(
+                            {
+                                "task_id": task_id,
+                                "error": response.error,
+                                "status_code": response.status_code,
+                                "response_data": response.response_data,
+                            }
+                        )
             case ["timeout", _]:
                 # Timeout occurred - some requests still processing in background
                 # Collect any responses that are available
@@ -980,12 +970,14 @@ async def submit_batch(ctx: Context, requests: list, idempotency_key: str = None
                         response = await future
                         all_responses.append(response)
                         if not response.success:
-                            errors.append({
-                                "task_id": task_id,
-                                "error": response.error,
-                                "status_code": response.status_code,
-                                "response_data": response.response_data,
-                            })
+                            errors.append(
+                                {
+                                    "task_id": task_id,
+                                    "error": response.error,
+                                    "status_code": response.status_code,
+                                    "response_data": response.response_data,
+                                }
+                            )
                     except Exception:
                         # Request still processing, will continue in background
                         pass
@@ -993,7 +985,11 @@ async def submit_batch(ctx: Context, requests: list, idempotency_key: str = None
         db_logger.error(f"Error in batch submission timeout handling: {str(e)}")
 
     # If idempotency key is provided and all tasks succeeded, purge the invocation
-    if idempotency_key and not errors and len(all_responses) == len(request_futures):
+    if (
+        idempotency_key
+        and not errors
+        and len(all_responses) == len(request_futures)
+    ):
         # All tasks completed successfully - purge the invocation to free up disk space
         try:
             invocation_id = await ctx.invocation_id()
@@ -1016,7 +1012,9 @@ async def submit_batch(ctx: Context, requests: list, idempotency_key: str = None
         "task_ids": task_ids,
         "errors": errors if errors else None,
         "info": "Remaining requests are being processed asynchronously in the background",
-        "batch_status": "all_succeeded" if not errors and len(all_responses) == len(request_futures) else "some_failed_or_pending"
+        "batch_status": "all_succeeded"
+        if not errors and len(all_responses) == len(request_futures)
+        else "some_failed_or_pending",
     }
 
 
