@@ -891,17 +891,16 @@ async def send_non_existing_codes_email(codes: list) -> None:
 
 @batch_service.handler("submit_batch")
 async def submit_batch(
-    ctx: Context, requests: list, idempotency_key: str = None
+    ctx: Context, requests: list
 ) -> Dict[str, str]:
     """
     Submit a batch of HTTP requests and wait for quick errors (5 second timeout).
 
-    If all HttpTasks succeed, the invocation will be purged immediately.
-    If any HttpTask fails, the invocation will be retained for 30 days (idempotency key retention).
+    If all HttpTasks succeed, the invocation will be processed asynchronously.
+    If any HttpTask fails, it will be logged and retried according to retry policy.
 
     Args:
-        requests: List of HTTP request data
-        idempotency_key: Optional idempotency key for batch tracking (enables retention management)
+        requests: List of HTTP request data (batch of requests to process)
 
     Returns:
         Status dict with task IDs and any immediate errors
@@ -942,6 +941,7 @@ async def submit_batch(
     errors = []
     timeout = timedelta(seconds=5)
     all_responses = []
+    all_tasks_completed = False
 
     try:
         # Use select to wait with timeout
@@ -952,6 +952,7 @@ async def submit_batch(
             case ["results", responses]:
                 # All completed within timeout - check for errors
                 all_responses = responses
+                all_tasks_completed = True
                 for (task_id, _), response in zip(request_futures, responses):
                     if not response.success:
                         errors.append(
@@ -984,11 +985,10 @@ async def submit_batch(
     except Exception as e:
         db_logger.error(f"Error in batch submission timeout handling: {str(e)}")
 
-    # If idempotency key is provided and all tasks succeeded, purge the invocation
+    # If all tasks succeeded AND all tasks completed within timeout, purge the invocation
     if (
-        idempotency_key
-        and not errors
-        and len(all_responses) == len(request_futures)
+        not errors
+        and all_tasks_completed
     ):
         # All tasks completed successfully - purge the invocation to free up disk space
         try:
@@ -1007,14 +1007,23 @@ async def submit_batch(
             )
 
     # Return response with any immediate errors, rest continue in background
+    batch_status_message = ""
+    if not errors and all_tasks_completed:
+        batch_status_message = "Batch completed successfully - invocation purged"
+    elif not errors and not all_tasks_completed:
+        batch_status_message = "All tasks succeeded but some are still processing - will purge after completion"
+    else:
+        batch_status_message = "Some tasks failed - invocation retained for retry"
+
     return {
         "message": f"Submitted {len(task_ids)} tasks for processing",
         "task_ids": task_ids,
         "errors": errors if errors else None,
         "info": "Remaining requests are being processed asynchronously in the background",
-        "batch_status": "all_succeeded"
-        if not errors and len(all_responses) == len(request_futures)
+        "batch_status": "all_succeeded_purged"
+        if not errors and all_tasks_completed
         else "some_failed_or_pending",
+        "status_details": batch_status_message,
     }
 
 
