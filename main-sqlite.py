@@ -15,8 +15,7 @@ from pydantic import BaseModel
 from restate import (
     Context,
     InvocationRetryPolicy,
-    ObjectContext,
-    VirtualObject,
+    Service,
     app,
 )
 
@@ -73,12 +72,31 @@ class DatabaseManager:
                 conn.close()
 
     def _initialize_database(self):
-        """Initialize database tables if they don't exist"""
+        """Initialize database tables if they don't exist with performance optimizations"""
         with self.execute_query() as conn:
-            # Create orders table
-            conn.execute("select(1);")
+            # Performance indexes for fast queries (safe to run - IF NOT EXISTS)
+            # These indexes optimize the most common query patterns
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_status_updated ON orders(status, updated_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_first_failure ON orders(first_failure_time)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_product_code ON orders(product_code)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_non_existing_codes_product ON non_existing_codes(product_code)"
+            )
 
             conn.commit()
+            db_logger.info("Database initialization completed with performance indexes")
 
     def execute_query(self):
         """Context manager for database operations"""
@@ -126,9 +144,8 @@ class HttpResponse(BaseModel):
     needs_manual_retry: bool = False
 
 
-http_task = VirtualObject(
+http_task = Service(
     "HttpTask",
-    inactivity_timeout=timedelta(days=30),
     invocation_retry_policy=InvocationRetryPolicy(
         initial_interval=timedelta(minutes=15),
         exponentiation_factor=2.0,
@@ -262,6 +279,9 @@ def insert_order_thread(request: HttpRequest, response: HttpResponse):
 
     try:
         with db_manager.execute_query() as conn:
+            # Set first_failure_time to current time for new orders
+            current_time = datetime.now().isoformat()
+
             # Use INSERT OR REPLACE to handle duplicates
             conn.execute(
                 """
@@ -269,8 +289,8 @@ def insert_order_thread(request: HttpRequest, response: HttpResponse):
                     order_id, customer_name, phone_number, document_type, document_number,
                     department_code, order_date, province, district, ward, address,
                     product_code, product_name, imei, quantity, revenue, source_type,
-                    status, error_code, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, error_code, first_failure_time, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     request.task_id,  # order_id
@@ -294,7 +314,8 @@ def insert_order_thread(request: HttpRequest, response: HttpResponse):
                     response.response_data.get(
                         "errorCode", response.error
                     ),  # error_code
-                    datetime.now().isoformat(),  # updated_at
+                    current_time,  # first_failure_time
+                    current_time,  # updated_at
                 ),
             )
 
@@ -327,7 +348,8 @@ def update_order_thread(request: HttpRequest, response: HttpResponse):
 
     try:
         with db_manager.execute_query() as conn:
-            # Update existing record
+            # Update existing record but preserve first_failure_time
+            # Only update updated_at, not first_failure_time
             conn.execute(
                 """
                 UPDATE orders
@@ -471,6 +493,51 @@ def cleanup_old_failed_orders_thread(days: int = 30):
         raise
 
 
+def check_retry_window_expired(task_id: str) -> bool:
+    """
+    Check if the retry window (30 days) has expired for a failed order.
+    Returns True if the order should stop being retried.
+    """
+    try:
+        with db_manager.execute_query() as conn:
+            cursor = conn.execute(
+                """
+                SELECT first_failure_time FROM orders
+                WHERE order_id = ? AND status = 'needs_retry'
+                LIMIT 1
+            """,
+                (task_id,),
+            )
+            result = cursor.fetchone()
+
+            if not result or not result[0]:
+                # No first_failure_time found, don't expire
+                return False
+
+            first_failure_time = datetime.fromisoformat(result[0])
+            current_time = datetime.now()
+            days_since_first_failure = (
+                current_time - first_failure_time
+            ).total_seconds() / (24 * 3600)
+
+            if days_since_first_failure >= 30:
+                db_logger.info(
+                    f"Retry window expired for task_id: {task_id} (failed for {days_since_first_failure:.1f} days)"
+                )
+                return True
+
+            db_logger.info(
+                f"Retry window active for task_id: {task_id} ({days_since_first_failure:.1f}/30 days)"
+            )
+            return False
+    except Exception as e:
+        db_logger.error(
+            f"Error checking retry window for {task_id}: {str(e)}"
+        )
+        # On error, don't expire (safer to keep retrying)
+        return False
+
+
 def delete_order_thread(task_id: str, request: HttpRequest = None):
     """Thread function to delete successful order from database"""
     db_logger.info(f"Starting delete_order_thread for task_id: {task_id}")
@@ -509,7 +576,7 @@ def delete_order_thread(task_id: str, request: HttpRequest = None):
 
 
 async def log_failed_order_to_db(
-    ctx: ObjectContext,
+    ctx: Context,
     request: HttpRequest,
     response: HttpResponse,
     db_path: str = "orders.db",
@@ -527,7 +594,7 @@ async def log_failed_order_to_db(
 
 
 async def delete_successful_order_from_db(
-    ctx: ObjectContext,
+    ctx: Context,
     task_id: str,
     request: HttpRequest = None,
     db_path: str = "orders.db",
@@ -583,9 +650,31 @@ def purge_batch_invocation(invocation_id: str) -> str:
 
 @http_task.handler("execute_request")
 async def execute_request(
-    ctx: ObjectContext, request: HttpRequest
+    ctx: Context, request: HttpRequest
 ) -> HttpResponse:
     """Execute a single HTTP request with error handling and auto-retry"""
+
+    # Check if 30-day retry window has expired
+    retry_window_expired = await ctx.run_typed(
+        "check_retry_window",
+        lambda: check_retry_window_expired(request.task_id),
+    )
+
+    if retry_window_expired:
+        # Delete the order and stop retrying after 30 days
+        db_logger.info(
+            f"30-day retry window expired for task_id: {request.task_id}. Deleting order and stopping retries."
+        )
+        await delete_successful_order_from_db(ctx, request.task_id, request)
+        # Return success to stop Restate from retrying
+        return HttpResponse(
+            task_id=request.task_id,
+            url=request.url,
+            status_code=0,
+            response_data={},
+            success=True,
+            error="Retry window expired (30 days), order removed from database",
+        )
 
     async def make_http_request():
         try:
@@ -890,9 +979,7 @@ async def send_non_existing_codes_email(codes: list) -> None:
 
 
 @batch_service.handler("submit_batch")
-async def submit_batch(
-    ctx: Context, requests: list
-) -> Dict[str, str]:
+async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     """
     Submit a batch of HTTP requests and wait for quick errors (5 second timeout).
 
@@ -933,7 +1020,8 @@ async def submit_batch(
         )
 
         # Start request processing asynchronously (don't await yet)
-        future = ctx.object_call(execute_request, task_id, request)
+        # Service calls don't need keys - each invocation is independent
+        future = ctx.service_call(execute_request, request)
         request_futures.append((task_id, future))
         task_ids.append(task_id)
 
@@ -985,42 +1073,22 @@ async def submit_batch(
     except Exception as e:
         db_logger.error(f"Error in batch submission timeout handling: {str(e)}")
 
-    # If all tasks succeeded AND all tasks completed within timeout, purge the invocation
-    if (
-        not errors
-        and all_tasks_completed
-    ):
-        # All tasks completed successfully - purge the invocation to free up disk space
-        try:
-            invocation_id = await ctx.invocation_id()
-            # Schedule purge operation to clean up invocation from Restate
-            await ctx.run_typed(
-                "purge_batch_invocation",
-                lambda: purge_batch_invocation(invocation_id),
-            )
-            db_logger.info(
-                f"Batch invocation {invocation_id} purged successfully (all tasks succeeded)"
-            )
-        except Exception as e:
-            db_logger.warning(
-                f"Could not purge batch invocation: {str(e)} (will be auto-purged after retention)"
-            )
-
     # Return response with any immediate errors, rest continue in background
+    # Note: Restate will automatically clean up completed invocations based on retention policy
     batch_status_message = ""
     if not errors and all_tasks_completed:
-        batch_status_message = "Batch completed successfully - invocation purged"
+        batch_status_message = "Batch completed successfully"
     elif not errors and not all_tasks_completed:
-        batch_status_message = "All tasks succeeded but some are still processing - will purge after completion"
+        batch_status_message = "All tasks succeeded but some are still processing"
     else:
-        batch_status_message = "Some tasks failed - invocation retained for retry"
+        batch_status_message = "Some tasks failed - will retry according to retry policy"
 
     return {
         "message": f"Submitted {len(task_ids)} tasks for processing",
         "task_ids": task_ids,
         "errors": errors if errors else None,
         "info": "Remaining requests are being processed asynchronously in the background",
-        "batch_status": "all_succeeded_purged"
+        "batch_status": "all_succeeded"
         if not errors and all_tasks_completed
         else "some_failed_or_pending",
         "status_details": batch_status_message,
