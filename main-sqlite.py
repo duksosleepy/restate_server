@@ -96,7 +96,9 @@ class DatabaseManager:
             )
 
             conn.commit()
-            db_logger.info("Database initialization completed with performance indexes")
+            db_logger.info(
+                "Database initialization completed with performance indexes"
+            )
 
     def execute_query(self):
         """Context manager for database operations"""
@@ -531,9 +533,7 @@ def check_retry_window_expired(task_id: str) -> bool:
             )
             return False
     except Exception as e:
-        db_logger.error(
-            f"Error checking retry window for {task_id}: {str(e)}"
-        )
+        db_logger.error(f"Error checking retry window for {task_id}: {str(e)}")
         # On error, don't expire (safer to keep retrying)
         return False
 
@@ -649,9 +649,7 @@ def purge_batch_invocation(invocation_id: str) -> str:
 
 
 @http_task.handler("execute_request")
-async def execute_request(
-    ctx: Context, request: HttpRequest
-) -> HttpResponse:
+async def execute_request(ctx: Context, request: HttpRequest) -> HttpResponse:
     """Execute a single HTTP request with error handling and auto-retry"""
 
     # Check if 30-day retry window has expired
@@ -1079,9 +1077,13 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     if not errors and all_tasks_completed:
         batch_status_message = "Batch completed successfully"
     elif not errors and not all_tasks_completed:
-        batch_status_message = "All tasks succeeded but some are still processing"
+        batch_status_message = (
+            "All tasks succeeded but some are still processing"
+        )
     else:
-        batch_status_message = "Some tasks failed - will retry according to retry policy"
+        batch_status_message = (
+            "Some tasks failed - will retry according to retry policy"
+        )
 
     return {
         "message": f"Submitted {len(task_ids)} tasks for processing",
