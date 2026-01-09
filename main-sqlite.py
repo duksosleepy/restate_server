@@ -649,7 +649,7 @@ def purge_batch_invocation(invocation_id: str) -> str:
 
 
 @http_task.handler("execute_request")
-async def execute_request(ctx: Context, request: HttpRequest) -> HttpResponse:
+async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
     """Execute a single HTTP request with error handling and auto-retry"""
 
     # Check if 30-day retry window has expired
@@ -672,7 +672,7 @@ async def execute_request(ctx: Context, request: HttpRequest) -> HttpResponse:
             response_data={},
             success=True,
             error="Retry window expired (30 days), order removed from database",
-        )
+        ).model_dump()
 
     async def make_http_request():
         try:
@@ -681,7 +681,10 @@ async def execute_request(ctx: Context, request: HttpRequest) -> HttpResponse:
                     request.url, json=request.data, timeout=30.0
                 )
 
-                # Check for error status codes that need retry
+                # Parse response data
+                response_data = response.json() if response.content else {}
+
+                # Check for error status codes
                 if response.status_code in [
                     400,
                     401,
@@ -692,27 +695,29 @@ async def execute_request(ctx: Context, request: HttpRequest) -> HttpResponse:
                     503,
                     504,
                 ]:
+                    # Return failure response - step completes successfully
+                    # but we'll process the error and retry the invocation after
                     return HttpResponse(
                         task_id=request.task_id,
                         url=request.url,
                         status_code=response.status_code,
-                        response_data=response.json()
-                        if response.content
-                        else {},
+                        response_data=response_data,
                         success=False,
                         error=f"HTTP {response.status_code} error",
                         needs_manual_retry=True,
                     ).model_dump()
 
+                # Success case - return the response
                 return HttpResponse(
                     task_id=request.task_id,
                     url=request.url,
                     status_code=response.status_code,
-                    response_data=response.json(),
+                    response_data=response_data,
                     success=True,
                 ).model_dump()
 
         except Exception as e:
+            # Network errors - return failure response
             return HttpResponse(
                 task_id=request.task_id,
                 url=request.url,
@@ -724,21 +729,41 @@ async def execute_request(ctx: Context, request: HttpRequest) -> HttpResponse:
             ).model_dump()
 
     # Execute the HTTP request durably
+    # The http_request step will always complete (either success or failure response)
     response_dict = await ctx.run_typed("http_request", make_http_request)
     # Convert dict back to HttpResponse object
     response = HttpResponse(**response_dict)
 
     # Handle success case - delete from database and update stats
     if response.success:
-        await delete_successful_order_from_db(ctx, request.task_id, request)
-        # Update daily stats for completed task
-        await ctx.run_typed(
-            "update_daily_stats_completed",
-            lambda: query_from_thread(update_daily_stats_thread, True, False),
-        )
-        return response
+        try:
+            await delete_successful_order_from_db(ctx, request.task_id, request)
+        except Exception as e:
+            db_logger.error(
+                f"Error deleting order from DB for task_id: {request.task_id}: {str(e)}"
+            )
+            # Continue anyway - the HTTP request succeeded
 
-    # Handle failure case - log to database and schedule retry
+        try:
+            # Update daily stats for completed task
+            await ctx.run_typed(
+                "update_daily_stats_completed",
+                lambda: query_from_thread(update_daily_stats_thread, True, False),
+            )
+        except Exception as e:
+            db_logger.error(
+                f"Error updating daily stats for task_id: {request.task_id}: {str(e)}"
+            )
+            # Continue anyway - the HTTP request succeeded
+
+        db_logger.info(
+            f"HttpTask completed successfully for task_id: {request.task_id}, "
+            f"status_code: {response.status_code}"
+        )
+        # Return the success response to complete the invocation
+        return response.model_dump()
+
+    # Handle failure case - process business logic, then raise exception to retry invocation
     if response.needs_manual_retry:
         # Store API error and extract product codes
         # Only process if errorCode exists (empty errorCode means success)
@@ -754,16 +779,35 @@ async def execute_request(ctx: Context, request: HttpRequest) -> HttpResponse:
                 # Check for duplicate document pattern first
                 duplicate_pattern = r"Chứng từ\s+.+?\s+đã nhập\."
                 if re.search(duplicate_pattern, error_code):
-                    # Delete the task instead of retrying
-                    await delete_successful_order_from_db(
-                        ctx, request.task_id, request
+                    # Duplicate document - treat as success, delete and complete
+                    try:
+                        await delete_successful_order_from_db(
+                            ctx, request.task_id, request
+                        )
+                    except Exception as e:
+                        db_logger.error(
+                            f"Error deleting duplicate order for task_id: {request.task_id}: {str(e)}"
+                        )
+                        # Continue anyway
+
+                    try:
+                        await ctx.run_typed(
+                            "update_daily_stats_completed",
+                            lambda: query_from_thread(
+                                update_daily_stats_thread, True, False
+                            ),
+                        )
+                    except Exception as e:
+                        db_logger.error(
+                            f"Error updating stats for duplicate task_id: {request.task_id}: {str(e)}"
+                        )
+                        # Continue anyway
+
+                    db_logger.info(
+                        f"Duplicate document detected for task_id: {request.task_id}, "
+                        f"treating as success"
                     )
-                    await ctx.run_typed(
-                        "update_daily_stats_completed",
-                        lambda: query_from_thread(
-                            update_daily_stats_thread, True, False
-                        ),
-                    )
+                    # Return success to complete the invocation
                     return HttpResponse(
                         task_id=request.task_id,
                         url=request.url,
@@ -772,7 +816,7 @@ async def execute_request(ctx: Context, request: HttpRequest) -> HttpResponse:
                         success=True,
                         error=f"Duplicate document detected and removed: {error_code}",
                         needs_manual_retry=False,
-                    )
+                    ).model_dump()
 
                 # Extract non-existing product codes
                 pattern = r"Mã hàng\s+([^\s]+(?:\s+[^\s]+)*?)\s+không tồn tại trong hệ thống"
@@ -801,14 +845,32 @@ async def execute_request(ctx: Context, request: HttpRequest) -> HttpResponse:
         else:
             # Empty errorCode means successful HTTP request - treat as success
             # Delete the successful order from database
-            await delete_successful_order_from_db(ctx, request.task_id, request)
-            await ctx.run_typed(
-                "update_daily_stats_completed",
-                lambda: query_from_thread(
-                    update_daily_stats_thread, True, False
-                ),
+            try:
+                await delete_successful_order_from_db(ctx, request.task_id, request)
+            except Exception as e:
+                db_logger.error(
+                    f"Error deleting order for empty errorCode task_id: {request.task_id}: {str(e)}"
+                )
+                # Continue anyway
+
+            try:
+                await ctx.run_typed(
+                    "update_daily_stats_completed",
+                    lambda: query_from_thread(
+                        update_daily_stats_thread, True, False
+                    ),
+                )
+            except Exception as e:
+                db_logger.error(
+                    f"Error updating stats for empty errorCode task_id: {request.task_id}: {str(e)}"
+                )
+                # Continue anyway
+
+            db_logger.info(
+                f"Empty errorCode for task_id: {request.task_id}, treating as success"
             )
-            return response
+            # Return success to complete the invocation
+            return response.model_dump()
 
         # Update daily stats for failed task
         await ctx.run_typed(
@@ -816,7 +878,21 @@ async def execute_request(ctx: Context, request: HttpRequest) -> HttpResponse:
             lambda: query_from_thread(update_daily_stats_thread, False, True),
         )
 
-    return response
+        # Raise exception to fail the invocation and trigger automatic retry
+        # according to InvocationRetryPolicy (15-minute intervals)
+        db_logger.warning(
+            f"HttpTask failed for task_id: {request.task_id}, "
+            f"status_code: {response.status_code}, raising exception to retry invocation"
+        )
+        raise Exception(
+            f"HTTP request failed: {response.error} (status_code: {response.status_code})"
+        )
+
+    # Should never reach here - all paths above either return or raise
+    db_logger.error(
+        f"Unexpected code path for task_id: {request.task_id}, response: {response}"
+    )
+    raise Exception("Unexpected error in execute_request handler")
 
 
 # Service for batch management
