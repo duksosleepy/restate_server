@@ -158,7 +158,8 @@ http_task = Service(
     ),
 )
 
-non_existing_codes = []
+# Thread-safe set for deduplication (used as cache, DB is source of truth)
+non_existing_codes_cache: set = set()
 
 
 def query_from_thread(query_func, *args):
@@ -238,10 +239,11 @@ def insert_non_existing_code_thread(product_code: str, order_id: str):
     try:
         with db_manager.execute_query() as conn:
             # Use INSERT OR IGNORE to handle duplicates gracefully
+            # email_sent defaults to 0 (not sent)
             conn.execute(
                 """
-                INSERT OR IGNORE INTO non_existing_codes (product_code, order_id)
-                VALUES (?, ?)
+                INSERT OR IGNORE INTO non_existing_codes (product_code, order_id, email_sent)
+                VALUES (?, ?, 0)
             """,
                 (product_code, order_id),
             )
@@ -259,6 +261,54 @@ def insert_non_existing_code_thread(product_code: str, order_id: str):
         db_logger.error(
             f"Error inserting non-existing code {product_code}: {str(e)}"
         )
+        raise
+
+
+def get_unsent_non_existing_codes_thread() -> list:
+    """Get all non-existing codes that haven't been sent via email yet"""
+    db_logger.info("Fetching unsent non-existing codes from database")
+
+    try:
+        with db_manager.execute_query() as conn:
+            cursor = conn.execute(
+                """
+                SELECT DISTINCT product_code FROM non_existing_codes
+                WHERE email_sent = 0
+                ORDER BY created_at ASC
+            """
+            )
+            codes = [row[0] for row in cursor.fetchall()]
+            db_logger.info(f"Found {len(codes)} unsent non-existing codes")
+            return codes
+    except Exception as e:
+        db_logger.error(f"Error fetching unsent non-existing codes: {str(e)}")
+        raise
+
+
+def mark_codes_as_sent_thread(codes: list) -> int:
+    """Mark the given product codes as sent in the database"""
+    if not codes:
+        return 0
+
+    db_logger.info(f"Marking {len(codes)} codes as sent")
+
+    try:
+        with db_manager.execute_query() as conn:
+            # Use parameterized query with placeholders for each code
+            placeholders = ",".join("?" * len(codes))
+            conn.execute(
+                f"""
+                UPDATE non_existing_codes
+                SET email_sent = 1
+                WHERE product_code IN ({placeholders}) AND email_sent = 0
+            """,
+                codes,
+            )
+            updated_count = conn.total_changes
+            db_logger.info(f"Marked {updated_count} codes as sent")
+            return updated_count
+    except Exception as e:
+        db_logger.error(f"Error marking codes as sent: {str(e)}")
         raise
 
 
@@ -821,8 +871,8 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
                     query_from_thread(
                         insert_non_existing_code_thread, code, request.task_id
                     )
-                    if code not in non_existing_codes:
-                        non_existing_codes.append(code)
+                    # Add to cache set (automatically handles duplicates)
+                    non_existing_codes_cache.add(code)
 
                 # Ensure proper UTF-8 encoding
                 try:
@@ -973,8 +1023,18 @@ def generate_excel_file(codes: list) -> str:
     return filename
 
 
-async def send_non_existing_codes_email(codes: list) -> None:
-    """Send email with the list of existing codes and Excel attachment"""
+def send_non_existing_codes_email_sync(codes: list = None) -> dict:
+    """
+    Send email with the list of non-existing codes and Excel attachment.
+
+    Args:
+        codes: List of codes to send. If None, fetches unsent codes from database.
+
+    Returns:
+        dict with status and count of codes sent
+    """
+    global non_existing_codes_cache
+
     try:
         import smtplib
         from email import encoders
@@ -982,9 +1042,17 @@ async def send_non_existing_codes_email(codes: list) -> None:
         from email.mime.multipart import MIMEMultipart
         from email.mime.text import MIMEText
 
+        # If no codes provided, fetch unsent codes from database
+        if codes is None:
+            codes = get_unsent_non_existing_codes_thread()
+
+        if not codes:
+            db_logger.info("No unsent codes to email")
+            return {"status": "no_codes", "count": 0}
+
         # Email configuration from environment variables
         smtp_server = os.getenv("SMTP_SERVER")
-        smtp_port = int(os.getenv("SMTP_PORT"))
+        smtp_port = int(os.getenv("SMTP_PORT", "587"))
         email_address = os.getenv("EMAIL_ADDRESS")
         email_password = os.getenv("EMAIL_PASSWORD")
         recipients = os.getenv(
@@ -1003,16 +1071,15 @@ async def send_non_existing_codes_email(codes: list) -> None:
         )
 
         # Create email body
-        if codes:
-            body = f"""
-                Thời gian xử lý: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        body = f"""
+            Thời gian xử lý: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
-                Tổng số mã hàng không tồn tại trong hệ thống: {len(codes)}
+            Tổng số mã hàng không tồn tại trong hệ thống: {len(codes)}
 
-                Chi tiết danh sách mã hàng được đính kèm trong file Excel.
+            Chi tiết danh sách mã hàng được đính kèm trong file Excel.
 
-                Vui lòng kiểm tra file đính kèm để xem danh sách đầy đủ.
-            """
+            Vui lòng kiểm tra file đính kèm để xem danh sách đầy đủ.
+        """
         msg.attach(MIMEText(body, "plain"))
 
         # Attach Excel file
@@ -1038,7 +1105,11 @@ async def send_non_existing_codes_email(codes: list) -> None:
         )
         server.quit()
 
-        non_existing_codes.clear()
+        # Mark codes as sent in database AFTER successful email
+        mark_codes_as_sent_thread(codes)
+
+        # Clear in-memory cache
+        non_existing_codes_cache.clear()
 
         # Clean up Excel file after sending
         try:
@@ -1046,12 +1117,13 @@ async def send_non_existing_codes_email(codes: list) -> None:
         except FileNotFoundError:
             pass
 
-        print(
-            f"Email sent successfully with {len(codes)} existing codes and Excel attachment"
+        db_logger.info(
+            f"Email sent successfully with {len(codes)} non-existing codes"
         )
+        return {"status": "sent", "count": len(codes)}
 
     except Exception as e:
-        print(f"Failed to send email: {e}")
+        db_logger.error(f"Failed to send email: {e}")
         # Clean up Excel file if email fails
         try:
             excel_filename = f"non_existing_codes_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -1059,6 +1131,7 @@ async def send_non_existing_codes_email(codes: list) -> None:
                 os.remove(excel_filename)
         except:
             pass
+        return {"status": "failed", "error": str(e), "count": 0}
 
 
 @batch_service.handler("submit_batch")
@@ -1184,27 +1257,26 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
 
 @batch_service.handler("send_single_email")
 async def send_single_email(ctx: Context) -> Dict[str, str]:
-    """Send a single email with existing codes"""
-    global non_existing_codes, email_scheduler_active
+    """Send a single email with non-existing codes from database"""
+    global email_scheduler_active
 
-    if non_existing_codes:
-        # Send email with current codes
-        codes_to_send = non_existing_codes.copy()
-        await send_non_existing_codes_email(codes_to_send)
+    # Send email using database as source of truth
+    result = await ctx.run_typed(
+        "send_non_existing_codes_email",
+        lambda: query_from_thread(send_non_existing_codes_email_sync, None),
+    )
 
-        # Clear only the in-memory list, not the database
-        non_existing_codes.clear()
+    # Stop the email scheduler after sending
+    email_scheduler_active = False
 
-        # Stop the email scheduler after sending
-        email_scheduler_active = False
-
+    if result["status"] == "sent":
         return {
-            "message": f"Email sent with {len(codes_to_send)} codes, scheduler stopped"
+            "message": f"Email sent with {result['count']} codes, scheduler stopped"
         }
+    elif result["status"] == "no_codes":
+        return {"message": "No unsent codes to send, email scheduler stopped"}
     else:
-        # No codes to send, stop the email scheduler
-        email_scheduler_active = False
-        return {"message": "No codes to send, email scheduler stopped"}
+        return {"message": f"Email failed: {result.get('error', 'unknown error')}"}
 
 
 @batch_service.handler("stop_email_scheduler")
