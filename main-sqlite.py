@@ -16,6 +16,7 @@ from restate import (
     Context,
     InvocationRetryPolicy,
     Service,
+    TerminalError,
     app,
 )
 
@@ -547,26 +548,20 @@ def delete_order_thread(task_id: str, request: HttpRequest = None):
             # Delete from orders table
             conn.execute("DELETE FROM orders WHERE order_id = ?", (task_id,))
 
-            # If request data is available, also delete from non_existing_codes table
-            if request:
-                try:
-                    details = request.data["data"][0].get("detail", [{}])[0]
-                    product_code = details.get("maHang")
-                    if product_code:
-                        db_logger.info(
-                            f"Deleting product code {product_code} from non_existing_codes table"
-                        )
-                        conn.execute(
-                            "DELETE FROM non_existing_codes WHERE product_code = ?",
-                            (product_code,),
-                        )
-                        db_logger.info(
-                            f"Deleted product code {product_code} from non_existing_codes table"
-                        )
-                except (KeyError, IndexError) as e:
-                    db_logger.warning(
-                        f"Could not extract product code from request for task_id {task_id}: {e}"
-                    )
+            # Delete ALL non_existing_codes associated with this order
+            # Multiple codes may have been inserted when the order failed with product code errors
+            db_logger.info(
+                f"Deleting all non_existing_codes for order_id: {task_id}"
+            )
+            cursor = conn.execute(
+                "DELETE FROM non_existing_codes WHERE order_id = ?",
+                (task_id,),
+            )
+            deleted_count = cursor.rowcount
+            if deleted_count > 0:
+                db_logger.info(
+                    f"Deleted {deleted_count} non_existing_code(s) for order_id: {task_id}"
+                )
 
         db_logger.info(f"Completed delete_order_thread for task_id: {task_id}")
         return f"Deleted successful order {task_id} from database"
@@ -878,15 +873,29 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
             lambda: query_from_thread(update_daily_stats_thread, False, True),
         )
 
-        # Raise exception to fail the invocation and trigger automatic retry
-        # according to InvocationRetryPolicy (15-minute intervals)
-        db_logger.warning(
-            f"HttpTask failed for task_id: {request.task_id}, "
-            f"status_code: {response.status_code}, raising exception to retry invocation"
-        )
-        raise Exception(
-            f"HTTP request failed: {response.error} (status_code: {response.status_code})"
-        )
+        # Determine if this error is retryable or terminal
+        # Client errors (4xx) are terminal - the request is invalid and won't succeed on retry
+        # Server errors (5xx) are retryable - the server may recover
+        if response.status_code in [400, 401, 403, 404]:
+            # Terminal error - do not retry
+            db_logger.warning(
+                f"HttpTask failed with terminal error for task_id: {request.task_id}, "
+                f"status_code: {response.status_code}, not retrying (client error)"
+            )
+            raise TerminalError(
+                f"HTTP request failed: {response.error} (status_code: {response.status_code})",
+                status_code=response.status_code
+            )
+        else:
+            # Retryable error - raise regular exception to trigger retry
+            # according to InvocationRetryPolicy (15-minute intervals)
+            db_logger.warning(
+                f"HttpTask failed for task_id: {request.task_id}, "
+                f"status_code: {response.status_code}, raising exception to retry invocation"
+            )
+            raise Exception(
+                f"HTTP request failed: {response.error} (status_code: {response.status_code})"
+            )
 
     # Should never reach here - all paths above either return or raise
     db_logger.error(
