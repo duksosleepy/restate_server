@@ -6,17 +6,17 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "aiohttp>=3.12.15",
-    "duckdb>=1.4.0",
-    "fastapi>=0.117.1",
+    "duckdb>=1.4.3",
+    "fastapi>=0.128.0",
     "httpx>=0.28.1",
-    "hypercorn>=0.17.3",
+    "hypercorn>=0.18.0",
     "libsql>=0.1.11",
     "libsql-experimental>=0.0.55",
     "openpyxl>=3.1.5",
     "pandas>=2.3.2",
     "pydantic>=2.11.9",
-    "python-dotenv>=1.1.1",
+    "python-dotenv>=1.2.1",
     "pyturso>=0.1.5",
-    "restate-sdk[serde]>=0.10.2",
-    "uvicorn>=0.37.0",
+    "restate-sdk[serde]>=0.14.2",
+    "uvicorn>=0.40.0",
 ]
