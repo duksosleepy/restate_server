@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
@@ -933,8 +935,7 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
                 f"status_code: {response.status_code}, not retrying (client error)"
             )
             raise TerminalError(
-                f"HTTP request failed: {response.error} (status_code: {response.status_code})",
-                status_code=response.status_code
+                f"HTTP request failed: {response.error} (status_code: {response.status_code})"
             )
         else:
             # Retryable error - raise regular exception to trigger retry
@@ -1165,11 +1166,14 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
 
     # Start all requests in parallel without blocking
     for req_data in requests:
-        # Use Ma_Don_Hang from the request data as task ID
+        # Generate unique task_id using hash of the entire request data
+        # This ensures each order item gets a unique ID even with same maDonHang
         try:
-            task_id = req_data["data"]["data"][0]["master"]["maDonHang"]
-        except (KeyError, IndexError, TypeError):
-            raise ValueError("Ma_Don_Hang is required for task identification")
+            # Create a deterministic hash from the request data
+            request_json = json.dumps(req_data, sort_keys=True)
+            task_id = hashlib.md5(request_json.encode()).hexdigest()
+        except (KeyError, IndexError, TypeError) as e:
+            raise ValueError(f"Failed to generate task_id from request data: {e}")
 
         request = HttpRequest(
             url=req_data["url"], data=req_data["data"], task_id=task_id

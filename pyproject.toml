@@ -17,6 +17,6 @@ dependencies = [
     "pydantic>=2.11.9",
     "python-dotenv>=1.2.1",
     "pyturso>=0.1.5",
-    "restate-sdk[serde]>=0.14.2",
-    "uvicorn>=0.40.0",
+    "restate-sdk[serde]>=0.16.0",
+    "uvicorn>=0.42.0",
 ]
