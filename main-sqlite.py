@@ -1138,21 +1138,22 @@ def send_non_existing_codes_email_sync(codes: list = None) -> dict:
 @batch_service.handler("submit_batch")
 async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     """
-    Submit a batch of HTTP requests and wait for quick errors (5 second timeout).
+    Submit a batch of HTTP requests sequentially (one at a time).
 
-    If all HttpTasks succeed, the invocation will be processed asynchronously.
-    If any HttpTask fails, it will be logged and retried according to retry policy.
+    Processes each request in order, waiting for each to complete before starting the next.
+    This prevents overloading the target server with parallel requests.
 
     Args:
         requests: List of HTTP request data (batch of requests to process)
 
     Returns:
-        Status dict with task IDs and any immediate errors
+        Status dict with task IDs and any errors encountered
     """
     global email_scheduler_active, first_submit_time
 
     task_ids = []
-    request_futures = []
+    errors = []
+    successful_count = 0
 
     # Set first submit time and start email scheduler if not already active
     if not email_scheduler_active:
@@ -1164,7 +1165,7 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
             send_single_email, arg={}, send_delay=timedelta(minutes=5)
         )
 
-    # Start all requests in parallel without blocking
+    # Process requests sequentially (one at a time)
     for req_data in requests:
         # Generate unique task_id using hash of the entire request data
         # This ensures each order item gets a unique ID even with same maDonHang
@@ -1178,83 +1179,51 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         request = HttpRequest(
             url=req_data["url"], data=req_data["data"], task_id=task_id
         )
-
-        # Start request processing asynchronously (don't await yet)
-        # Service calls don't need keys - each invocation is independent
-        future = ctx.service_call(execute_request, request)
-        request_futures.append((task_id, future))
         task_ids.append(task_id)
 
-    # Wait for quick errors with 5 second timeout
-    errors = []
-    timeout = timedelta(seconds=5)
-    all_responses = []
-    all_tasks_completed = False
+        # Execute request sequentially - await immediately before processing next request
+        try:
+            response = await ctx.service_call(execute_request, request)
 
-    try:
-        # Use select to wait with timeout
-        match await restate.select(
-            results=restate.gather(*[f for _, f in request_futures]),
-            timeout=ctx.sleep(timeout),
-        ):
-            case ["results", responses]:
-                # All completed within timeout - check for errors
-                all_responses = responses
-                all_tasks_completed = True
-                for (task_id, _), response in zip(request_futures, responses):
-                    if not response.success:
-                        errors.append(
-                            {
-                                "task_id": task_id,
-                                "error": response.error,
-                                "status_code": response.status_code,
-                                "response_data": response.response_data,
-                            }
-                        )
-            case ["timeout", _]:
-                # Timeout occurred - some requests still processing in background
-                # Collect any responses that are available
-                for task_id, future in request_futures:
-                    try:
-                        response = await future
-                        all_responses.append(response)
-                        if not response.success:
-                            errors.append(
-                                {
-                                    "task_id": task_id,
-                                    "error": response.error,
-                                    "status_code": response.status_code,
-                                    "response_data": response.response_data,
-                                }
-                            )
-                    except Exception:
-                        # Request still processing, will continue in background
-                        pass
-    except Exception as e:
-        db_logger.error(f"Error in batch submission timeout handling: {str(e)}")
+            if response.success:
+                successful_count += 1
+            else:
+                errors.append(
+                    {
+                        "task_id": task_id,
+                        "error": response.error,
+                        "status_code": response.status_code,
+                        "response_data": response.response_data,
+                    }
+                )
+        except Exception as e:
+            # Catch any unexpected errors during service call
+            db_logger.error(f"Error executing request for task_id {task_id}: {str(e)}")
+            errors.append(
+                {
+                    "task_id": task_id,
+                    "error": str(e),
+                    "status_code": 0,
+                    "response_data": {},
+                }
+            )
 
-    # Return response with any immediate errors, rest continue in background
-    # Note: Restate will automatically clean up completed invocations based on retention policy
+    # Return response with processing results
     batch_status_message = ""
-    if not errors and all_tasks_completed:
-        batch_status_message = "Batch completed successfully"
-    elif not errors and not all_tasks_completed:
-        batch_status_message = (
-            "All tasks succeeded but some are still processing"
-        )
+    if not errors:
+        batch_status_message = "All tasks completed successfully"
     else:
         batch_status_message = (
-            "Some tasks failed - will retry according to retry policy"
+            f"{successful_count} succeeded, {len(errors)} failed - failed tasks will retry according to retry policy"
         )
 
     return {
-        "message": f"Submitted {len(task_ids)} tasks for processing",
+        "message": f"Processed {len(task_ids)} tasks sequentially",
         "task_ids": task_ids,
+        "successful_count": successful_count,
+        "failed_count": len(errors),
         "errors": errors if errors else None,
-        "info": "Remaining requests are being processed asynchronously in the background",
-        "batch_status": "all_succeeded"
-        if not errors and all_tasks_completed
-        else "some_failed_or_pending",
+        "batch_status": "all_succeeded" if not errors else "some_failed",
         "status_details": batch_status_message,
     }
 
