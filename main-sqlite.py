@@ -315,7 +315,8 @@ def mark_codes_as_sent_thread(codes: list) -> int:
 
 
 def insert_order_thread(request: HttpRequest, response: HttpResponse):
-    """Thread function to insert new order in database"""
+    """Thread function to insert new order in database
+    Handles orders with multiple detail items (combined by maDonHang)"""
     db_logger.info(
         f"Starting insert_order_thread for task_id: {request.task_id}"
     )
@@ -323,68 +324,77 @@ def insert_order_thread(request: HttpRequest, response: HttpResponse):
     # Extract order data from the request
     try:
         order_data = request.data["data"][0]["master"]
-        details = request.data["data"][0].get("detail", [{}])[0]
+        details_list = request.data["data"][0].get("detail", [])
     except (KeyError, IndexError):
         order_data = {}
-        details = {}
+        details_list = []
 
     # Determine source_type based on maDonHang
     ma_don_hang = order_data.get("maDonHang", "")
     source_type = "offline" if "/" in ma_don_hang else "online"
+
+    if not details_list:
+        db_logger.warning(f"No detail items found for task_id: {request.task_id}")
+        return f"No details to insert for order {request.task_id}"
 
     try:
         with db_manager.execute_query() as conn:
             # Set first_failure_time to current time for new orders
             current_time = datetime.now().isoformat()
 
-            # Use INSERT OR REPLACE to handle duplicates
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO orders (
-                    order_id, customer_name, phone_number, document_type, document_number,
-                    department_code, order_date, province, district, ward, address,
-                    product_code, product_name, imei, quantity, revenue, source_type,
-                    status, error_code, first_failure_time, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    request.task_id,  # order_id
-                    order_data.get("tenKhachHang"),  # customer_name
-                    order_data.get("soDienThoai"),  # phone_number
-                    order_data.get("maCT"),  # document_type
-                    order_data.get("soCT"),  # document_number
-                    order_data.get("maBoPhan"),  # department_code
-                    order_data.get("ngayCT"),  # order_date
-                    order_data.get("tinhThanh"),  # province
-                    order_data.get("quanHuyen"),  # district
-                    order_data.get("phuongXa"),  # ward
-                    order_data.get("diaChi"),  # address
-                    details.get("maHang"),  # product_code
-                    details.get("tenHang"),  # product_name
-                    details.get("imei"),  # imei
-                    details.get("soLuong"),  # quantity
-                    details.get("doanhThu"),  # revenue
-                    source_type,  # source_type
-                    "needs_retry",  # status
-                    response.response_data.get(
-                        "errorCode", response.error
-                    ),  # error_code
-                    current_time,  # first_failure_time
-                    current_time,  # updated_at
-                ),
-            )
+            # Insert each detail item as a separate order record
+            inserted_count = 0
+            for details in details_list:
+                # Use INSERT OR REPLACE to handle duplicates
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO orders (
+                        order_id, customer_name, phone_number, document_type, document_number,
+                        department_code, order_date, province, district, ward, address,
+                        product_code, product_name, imei, quantity, revenue, source_type,
+                        status, error_code, first_failure_time, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        request.task_id,  # order_id
+                        order_data.get("tenKhachHang"),  # customer_name
+                        order_data.get("soDienThoai"),  # phone_number
+                        order_data.get("maCT"),  # document_type
+                        order_data.get("soCT"),  # document_number
+                        order_data.get("maBoPhan"),  # department_code
+                        order_data.get("ngayCT"),  # order_date
+                        order_data.get("tinhThanh"),  # province
+                        order_data.get("quanHuyen"),  # district
+                        order_data.get("phuongXa"),  # ward
+                        order_data.get("diaChi"),  # address
+                        details.get("maHang"),  # product_code
+                        details.get("tenHang"),  # product_name
+                        details.get("imei"),  # imei
+                        details.get("soLuong"),  # quantity
+                        details.get("doanhThu"),  # revenue
+                        source_type,  # source_type
+                        "needs_retry",  # status
+                        response.response_data.get(
+                            "errorCode", response.error
+                        ),  # error_code
+                        current_time,  # first_failure_time
+                        current_time,  # updated_at
+                    ),
+                )
+                inserted_count += 1
 
         db_logger.info(
-            f"Completed insert_order_thread for task_id: {request.task_id}"
+            f"Completed insert_order_thread for task_id: {request.task_id}, inserted {inserted_count} detail items"
         )
-        return f"Inserted new order {request.task_id} to database"
+        return f"Inserted new order {request.task_id} with {inserted_count} detail items to database"
     except Exception as e:
         db_logger.error(f"Error inserting order {request.task_id}: {str(e)}")
         raise
 
 
 def update_order_thread(request: HttpRequest, response: HttpResponse):
-    """Thread function to update existing order based on order_id, product_code, and imei"""
+    """Thread function to update existing order based on order_id, product_code, and imei
+    Handles orders with multiple detail items (combined by maDonHang)"""
     db_logger.info(
         f"Starting update_order_thread for task_id: {request.task_id}"
     )
@@ -392,75 +402,82 @@ def update_order_thread(request: HttpRequest, response: HttpResponse):
     # Extract order data from the request
     try:
         order_data = request.data["data"][0]["master"]
-        details = request.data["data"][0].get("detail", [{}])[0]
+        details_list = request.data["data"][0].get("detail", [])
     except (KeyError, IndexError):
         order_data = {}
-        details = {}
+        details_list = []
 
     # Determine source_type based on maDonHang
     ma_don_hang = order_data.get("maDonHang", "")
     source_type = "offline" if "/" in ma_don_hang else "online"
 
+    if not details_list:
+        db_logger.warning(f"No detail items found for task_id: {request.task_id}")
+        return f"No details to update for order {request.task_id}"
+
     try:
         with db_manager.execute_query() as conn:
-            # Update existing record but preserve first_failure_time
+            # Update each detail item - update existing records but preserve first_failure_time
             # Only update updated_at, not first_failure_time
-            conn.execute(
-                """
-                UPDATE orders
-                SET
-                    customer_name = ?,
-                    phone_number = ?,
-                    document_type = ?,
-                    document_number = ?,
-                    department_code = ?,
-                    order_date = ?,
-                    province = ?,
-                    district = ?,
-                    ward = ?,
-                    address = ?,
-                    product_code = ?,
-                    product_name = ?,
-                    imei = ?,
-                    quantity = ?,
-                    revenue = ?,
-                    source_type = ?,
-                    error_code = ?,
-                    updated_at = ?,
-                    status = 'needs_retry'
-                WHERE order_id = ? AND product_code = ? AND imei = ?
-            """,
-                (
-                    order_data.get("tenKhachHang"),  # customer_name
-                    order_data.get("soDienThoai"),  # phone_number
-                    order_data.get("maCT"),  # document_type
-                    order_data.get("soCT"),  # document_number
-                    order_data.get("maBoPhan"),  # department_code
-                    order_data.get("ngayCT"),  # order_date
-                    order_data.get("tinhThanh"),  # province
-                    order_data.get("quanHuyen"),  # district
-                    order_data.get("phuongXa"),  # ward
-                    order_data.get("diaChi"),  # address
-                    details.get("maHang"),  # product_code
-                    details.get("tenHang"),  # product_name
-                    details.get("imei"),  # imei
-                    details.get("soLuong"),  # quantity
-                    details.get("doanhThu"),  # revenue
-                    source_type,  # source_type
-                    response.response_data.get(
-                        "errorCode", response.error
-                    ),  # error_code
-                    datetime.now().isoformat(),  # updated_at
-                    request.task_id,  # WHERE order_id
-                    details.get("maHang"),  # WHERE product_code
-                    details.get("imei"),  # WHERE imei
-                ),
-            )
+            updated_count = 0
+            for details in details_list:
+                conn.execute(
+                    """
+                    UPDATE orders
+                    SET
+                        customer_name = ?,
+                        phone_number = ?,
+                        document_type = ?,
+                        document_number = ?,
+                        department_code = ?,
+                        order_date = ?,
+                        province = ?,
+                        district = ?,
+                        ward = ?,
+                        address = ?,
+                        product_code = ?,
+                        product_name = ?,
+                        imei = ?,
+                        quantity = ?,
+                        revenue = ?,
+                        source_type = ?,
+                        error_code = ?,
+                        updated_at = ?,
+                        status = 'needs_retry'
+                    WHERE order_id = ? AND product_code = ? AND imei = ?
+                """,
+                    (
+                        order_data.get("tenKhachHang"),  # customer_name
+                        order_data.get("soDienThoai"),  # phone_number
+                        order_data.get("maCT"),  # document_type
+                        order_data.get("soCT"),  # document_number
+                        order_data.get("maBoPhan"),  # department_code
+                        order_data.get("ngayCT"),  # order_date
+                        order_data.get("tinhThanh"),  # province
+                        order_data.get("quanHuyen"),  # district
+                        order_data.get("phuongXa"),  # ward
+                        order_data.get("diaChi"),  # address
+                        details.get("maHang"),  # product_code
+                        details.get("tenHang"),  # product_name
+                        details.get("imei"),  # imei
+                        details.get("soLuong"),  # quantity
+                        details.get("doanhThu"),  # revenue
+                        source_type,  # source_type
+                        response.response_data.get(
+                            "errorCode", response.error
+                        ),  # error_code
+                        datetime.now().isoformat(),  # updated_at
+                        request.task_id,  # WHERE order_id
+                        details.get("maHang"),  # WHERE product_code
+                        details.get("imei"),  # WHERE imei
+                    ),
+                )
+                updated_count += 1
 
         db_logger.info(
-            f"Completed update_order_thread for task_id: {request.task_id}"
+            f"Completed update_order_thread for task_id: {request.task_id}, updated {updated_count} detail items"
         )
-        return f"Updated existing order {request.task_id} in database"
+        return f"Updated existing order {request.task_id} with {updated_count} detail items in database"
     except Exception as e:
         db_logger.error(f"Error updating order {request.task_id}: {str(e)}")
         raise
@@ -469,38 +486,51 @@ def update_order_thread(request: HttpRequest, response: HttpResponse):
 def handle_order_database_operation(
     request: HttpRequest, response: HttpResponse
 ):
-    """Determine whether to insert or update based on order_id, product_code, and imei"""
+    """Determine whether to insert or update based on order_id, product_code, and imei
+    Handles orders with multiple detail items (combined by maDonHang)"""
     db_logger.info(
         f"Starting handle_order_database_operation for task_id: {request.task_id}"
     )
 
-    # Extract product_code and imei from request
+    # Extract product_codes and imeis from request
     try:
-        details = request.data["data"][0].get("detail", [{}])[0]
-        current_product_code = details.get("maHang")
-        current_imei = details.get("imei")
-    except (KeyError, IndexError):
-        current_product_code = None
-        current_imei = None
-
-    try:
+        details_list = request.data["data"][0].get("detail", [])
+        if not details_list:
+            db_logger.warning(f"No detail items found for task_id: {request.task_id}")
+            return insert_order_thread(request, response)
+        
+        # Check if ANY of the detail items exist in the database
+        # If at least one exists, we'll update; otherwise insert
         with db_manager.execute_query() as conn:
-            # Check if record exists with same order_id, product_code, and imei
-            cursor = conn.execute(
-                """
-                SELECT COUNT(*) FROM orders
-                WHERE order_id = ? AND product_code = ? AND imei = ?
-            """,
-                (request.task_id, current_product_code, current_imei),
-            )
+            exists_count = 0
+            for details in details_list:
+                current_product_code = details.get("maHang")
+                current_imei = details.get("imei")
+                
+                cursor = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM orders
+                    WHERE order_id = ? AND product_code = ? AND imei = ?
+                """,
+                    (request.task_id, current_product_code, current_imei),
+                )
+                
+                if cursor.fetchone()[0] > 0:
+                    exists_count += 1
 
-            exists_with_same_identifiers = cursor.fetchone()[0] > 0
+            exists_with_same_identifiers = exists_count > 0
 
         if exists_with_same_identifiers:
-            # Update existing record
+            # Update existing record(s)
+            db_logger.info(
+                f"Found {exists_count} existing detail items for task_id: {request.task_id}, updating"
+            )
             return update_order_thread(request, response)
         else:
-            # Insert new record
+            # Insert new record(s)
+            db_logger.info(
+                f"No existing detail items found for task_id: {request.task_id}, inserting"
+            )
             return insert_order_thread(request, response)
     except Exception as e:
         db_logger.error(
