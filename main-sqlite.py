@@ -729,6 +729,17 @@ def purge_batch_invocation(invocation_id: str) -> str:
 async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
     """Execute a single HTTP request with error handling and auto-retry"""
 
+    # Log request detail count for debugging
+    try:
+        detail_count = len(request.data.get("data", [{}])[0].get("detail", []))
+        ma_don_hang = request.data.get("data", [{}])[0].get("master", {}).get("maDonHang", "UNKNOWN")
+        db_logger.info(
+            f"execute_request invoked for maDonHang: {ma_don_hang}, task_id: {request.task_id} "
+            f"with {detail_count} detail item(s) in request.data"
+        )
+    except Exception as e:
+        db_logger.warning(f"Failed to log detail count in execute_request: {e}")
+
     # Check if 30-day retry window has expired
     retry_window_expired = await ctx.run_typed(
         "check_retry_window",
@@ -753,6 +764,17 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
 
     async def make_http_request():
         try:
+            # Log the detail array being sent to final CRM server
+            try:
+                detail_count = len(request.data.get("data", [{}])[0].get("detail", []))
+                db_logger.info(
+                    f"Sending request to final CRM server for task_id: {request.task_id} "
+                    f"with {detail_count} detail item(s)"
+                )
+                db_logger.debug(f"Request data for task_id {request.task_id}: {request.data}")
+            except Exception as e:
+                db_logger.warning(f"Failed to log detail count: {e}")
+
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     request.url, json=request.data, timeout=30.0
@@ -1205,6 +1227,17 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
             task_id = hashlib.md5(request_json.encode()).hexdigest()
         except (KeyError, IndexError, TypeError) as e:
             raise ValueError(f"Failed to generate task_id from request data: {e}")
+
+        # Log the detail array received from scheduling task
+        try:
+            detail_count = len(req_data.get("data", {}).get("data", [{}])[0].get("detail", []))
+            ma_don_hang = req_data.get("data", {}).get("data", [{}])[0].get("master", {}).get("maDonHang", "UNKNOWN")
+            db_logger.info(
+                f"Received batch request for maDonHang: {ma_don_hang}, task_id: {task_id} "
+                f"with {detail_count} detail item(s)"
+            )
+        except Exception as e:
+            db_logger.warning(f"Failed to log received detail count: {e}")
 
         request = HttpRequest(
             url=req_data["url"], data=req_data["data"], task_id=task_id
