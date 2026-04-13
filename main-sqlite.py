@@ -166,15 +166,9 @@ non_existing_codes_cache: set = set()
 
 def query_from_thread(query_func, *args):
     """Execute a database query in a thread-safe manner"""
-    db_logger.info(
-        f"Executing database query with function: {query_func.__name__}"
-    )
     with sqlite_lock:
         try:
             result = query_func(*args)
-            db_logger.info(
-                f"Database query completed successfully: {query_func.__name__}"
-            )
             return result
         except Exception as e:
             db_logger.error(
@@ -223,10 +217,6 @@ def update_daily_stats_thread(
                         datetime.now().isoformat(),
                     ),
                 )
-
-        db_logger.info(
-            f"Updated daily stats - completed: {task_completed}, failed: {task_failed}"
-        )
     except Exception as e:
         db_logger.error(f"Error updating daily stats: {str(e)}")
         raise
@@ -234,10 +224,6 @@ def update_daily_stats_thread(
 
 def insert_non_existing_code_thread(product_code: str, order_id: str):
     """Thread function to insert non-existing product code into database"""
-    db_logger.info(
-        f"Inserting non-existing code {product_code} for order {order_id}"
-    )
-
     try:
         with db_manager.execute_query() as conn:
             # Use INSERT OR IGNORE to handle duplicates gracefully
@@ -249,16 +235,6 @@ def insert_non_existing_code_thread(product_code: str, order_id: str):
             """,
                 (product_code, order_id),
             )
-
-            # Check if the insert was successful
-            if conn.total_changes > 0:
-                db_logger.info(
-                    f"Inserted non-existing code {product_code} for order {order_id}"
-                )
-            else:
-                db_logger.info(
-                    f"Non-existing code {product_code} already exists in database"
-                )
     except Exception as e:
         db_logger.error(
             f"Error inserting non-existing code {product_code}: {str(e)}"
@@ -268,8 +244,6 @@ def insert_non_existing_code_thread(product_code: str, order_id: str):
 
 def get_unsent_non_existing_codes_thread() -> list:
     """Get all non-existing codes that haven't been sent via email yet"""
-    db_logger.info("Fetching unsent non-existing codes from database")
-
     try:
         with db_manager.execute_query() as conn:
             cursor = conn.execute(
@@ -280,7 +254,6 @@ def get_unsent_non_existing_codes_thread() -> list:
             """
             )
             codes = [row[0] for row in cursor.fetchall()]
-            db_logger.info(f"Found {len(codes)} unsent non-existing codes")
             return codes
     except Exception as e:
         db_logger.error(f"Error fetching unsent non-existing codes: {str(e)}")
@@ -291,8 +264,6 @@ def mark_codes_as_sent_thread(codes: list) -> int:
     """Mark the given product codes as sent in the database"""
     if not codes:
         return 0
-
-    db_logger.info(f"Marking {len(codes)} codes as sent")
 
     try:
         with db_manager.execute_query() as conn:
@@ -307,7 +278,6 @@ def mark_codes_as_sent_thread(codes: list) -> int:
                 codes,
             )
             updated_count = conn.total_changes
-            db_logger.info(f"Marked {updated_count} codes as sent")
             return updated_count
     except Exception as e:
         db_logger.error(f"Error marking codes as sent: {str(e)}")
@@ -623,8 +593,6 @@ def check_retry_window_expired(task_id: str) -> bool:
 
 def delete_order_thread(task_id: str, request: HttpRequest = None):
     """Thread function to delete successful order from database"""
-    db_logger.info(f"Starting delete_order_thread for task_id: {task_id}")
-
     try:
         with db_manager.execute_query() as conn:
             # Delete from orders table
@@ -632,20 +600,11 @@ def delete_order_thread(task_id: str, request: HttpRequest = None):
 
             # Delete ALL non_existing_codes associated with this order
             # Multiple codes may have been inserted when the order failed with product code errors
-            db_logger.info(
-                f"Deleting all non_existing_codes for order_id: {task_id}"
-            )
-            cursor = conn.execute(
+            conn.execute(
                 "DELETE FROM non_existing_codes WHERE order_id = ?",
                 (task_id,),
             )
-            deleted_count = cursor.rowcount
-            if deleted_count > 0:
-                db_logger.info(
-                    f"Deleted {deleted_count} non_existing_code(s) for order_id: {task_id}"
-                )
 
-        db_logger.info(f"Completed delete_order_thread for task_id: {task_id}")
         return f"Deleted successful order {task_id} from database"
     except Exception as e:
         db_logger.error(f"Error deleting order {task_id}: {str(e)}")
@@ -729,16 +688,6 @@ def purge_batch_invocation(invocation_id: str) -> str:
 async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
     """Execute a single HTTP request with error handling and auto-retry"""
 
-    # Log request detail count for debugging
-    try:
-        detail_count = len(request.data.get("data", [{}])[0].get("detail", []))
-        ma_don_hang = request.data.get("data", [{}])[0].get("master", {}).get("maDonHang", "UNKNOWN")
-        db_logger.info(
-            f"execute_request invoked for maDonHang: {ma_don_hang}, task_id: {request.task_id} "
-            f"with {detail_count} detail item(s) in request.data"
-        )
-    except Exception as e:
-        db_logger.warning(f"Failed to log detail count in execute_request: {e}")
 
     # Check if 30-day retry window has expired
     retry_window_expired = await ctx.run_typed(
@@ -764,17 +713,6 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
 
     async def make_http_request():
         try:
-            # Log the detail array being sent to final CRM server
-            try:
-                detail_count = len(request.data.get("data", [{}])[0].get("detail", []))
-                db_logger.info(
-                    f"Sending request to final CRM server for task_id: {request.task_id} "
-                    f"with {detail_count} detail item(s)"
-                )
-                db_logger.debug(f"Request data for task_id {request.task_id}: {request.data}")
-            except Exception as e:
-                db_logger.warning(f"Failed to log detail count: {e}")
-
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     request.url, json=request.data, timeout=30.0
@@ -855,10 +793,6 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
             )
             # Continue anyway - the HTTP request succeeded
 
-        db_logger.info(
-            f"HttpTask completed successfully for task_id: {request.task_id}, "
-            f"status_code: {response.status_code}"
-        )
         # Return the success response to complete the invocation
         return response.model_dump()
 
@@ -1009,10 +943,6 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
 
 # Service for batch management
 batch_service = restate.Service("BatchService")
-
-# Global variables for email timing
-email_scheduler_active = False
-first_submit_time = None
 
 
 def generate_excel_file(codes: list) -> str:
@@ -1201,21 +1131,9 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     Returns:
         Status dict with task IDs and any errors encountered
     """
-    global email_scheduler_active, first_submit_time
-
     task_ids = []
     errors = []
     successful_count = 0
-
-    # Set first submit time and start email scheduler if not already active
-    if not email_scheduler_active:
-        first_submit_time = asyncio.get_event_loop().time()
-        email_scheduler_active = True
-
-        # Schedule single email after 5 minutes (fire-and-forget)
-        ctx.service_send(
-            send_single_email, arg={}, send_delay=timedelta(minutes=5)
-        )
 
     # Process requests sequentially (one at a time)
     for req_data in requests:
@@ -1228,17 +1146,6 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         except (KeyError, IndexError, TypeError) as e:
             raise ValueError(f"Failed to generate task_id from request data: {e}")
 
-        # Log the detail array received from scheduling task
-        try:
-            detail_count = len(req_data.get("data", {}).get("data", [{}])[0].get("detail", []))
-            ma_don_hang = req_data.get("data", {}).get("data", [{}])[0].get("master", {}).get("maDonHang", "UNKNOWN")
-            db_logger.info(
-                f"Received batch request for maDonHang: {ma_don_hang}, task_id: {task_id} "
-                f"with {detail_count} detail item(s)"
-            )
-        except Exception as e:
-            db_logger.warning(f"Failed to log received detail count: {e}")
-
         request = HttpRequest(
             url=req_data["url"], data=req_data["data"], task_id=task_id
         )
@@ -1246,17 +1153,18 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
 
         # Execute request sequentially - await immediately before processing next request
         try:
-            response = await ctx.service_call(execute_request, request)
+            response_dict = await ctx.service_call(execute_request, request)
 
-            if response.success:
+            # Check success from dict directly
+            if response_dict.get("success", False):
                 successful_count += 1
             else:
                 errors.append(
                     {
                         "task_id": task_id,
-                        "error": response.error,
-                        "status_code": response.status_code,
-                        "response_data": response.response_data,
+                        "error": response_dict.get("error", "Unknown error"),
+                        "status_code": response_dict.get("status_code", 0),
+                        "response_data": response_dict.get("response_data", {}),
                     }
                 )
         except Exception as e:
@@ -1270,6 +1178,20 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
                     "response_data": {},
                 }
             )
+
+    # Send email with non-existing codes immediately after processing all orders
+    db_logger.info("Checking for non-existing codes to email...")
+    email_result = await ctx.run_typed(
+        "send_non_existing_codes_email",
+        lambda: query_from_thread(send_non_existing_codes_email_sync, None),
+    )
+
+    if email_result["status"] == "sent":
+        db_logger.info(f"Email sent with {email_result['count']} non-existing codes")
+    elif email_result["status"] == "no_codes":
+        db_logger.info("No non-existing codes to email")
+    else:
+        db_logger.error(f"Failed to send non-existing codes email: {email_result.get('error', 'unknown')}")
 
     # Return response with processing results
     batch_status_message = ""
@@ -1288,42 +1210,29 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         "errors": errors if errors else None,
         "batch_status": "all_succeeded" if not errors else "some_failed",
         "status_details": batch_status_message,
+        "email_result": email_result,
     }
 
 
 @batch_service.handler("send_single_email")
 async def send_single_email(ctx: Context) -> Dict[str, str]:
     """Send a single email with non-existing codes from database"""
-    global email_scheduler_active
-
     # Send email using database as source of truth
     result = await ctx.run_typed(
         "send_non_existing_codes_email",
         lambda: query_from_thread(send_non_existing_codes_email_sync, None),
     )
 
-    # Stop the email scheduler after sending
-    email_scheduler_active = False
-
     if result["status"] == "sent":
         return {
-            "message": f"Email sent with {result['count']} codes, scheduler stopped"
+            "message": f"Email sent with {result['count']} codes"
         }
     elif result["status"] == "no_codes":
-        return {"message": "No unsent codes to send, email scheduler stopped"}
+        return {"message": "No unsent codes to send"}
     else:
         return {"message": f"Email failed: {result.get('error', 'unknown error')}"}
 
 
-@batch_service.handler("stop_email_scheduler")
-async def stop_email_scheduler(ctx: Context) -> Dict[str, str]:
-    """Stop the email scheduler"""
-    global email_scheduler_active, first_submit_time
-
-    email_scheduler_active = False
-    first_submit_time = None
-
-    return {"message": "Email scheduler stopped"}
 
 
 @batch_service.handler("cleanup_old_failed_orders")
