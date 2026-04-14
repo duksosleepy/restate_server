@@ -154,8 +154,8 @@ http_task = Service(
     invocation_retry_policy=InvocationRetryPolicy(
         initial_interval=timedelta(minutes=15),
         exponentiation_factor=2.0,
-        max_interval=None,
-        max_attempts=None,
+        max_interval=timedelta(hours=24),  # Cap at 24 hours between retries
+        max_attempts=None,  # Unlimited attempts
         on_max_attempts=None,
     ),
 )
@@ -509,7 +509,7 @@ def handle_order_database_operation(
         raise
 
 
-def cleanup_old_failed_orders_thread(days: int = 30):
+def cleanup_old_failed_orders_thread(days: int = 2):
     """Thread function to cleanup orders that failed for more than specified days"""
     db_logger.info(
         f"Starting cleanup_old_failed_orders_thread for orders older than {days} days"
@@ -517,7 +517,7 @@ def cleanup_old_failed_orders_thread(days: int = 30):
 
     try:
         with db_manager.execute_query() as conn:
-            # Calculate cutoff date (30 days ago)
+            # Calculate cutoff date (2 days ago by default)
             cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
 
             # Get orders that will be deleted
@@ -550,7 +550,7 @@ def cleanup_old_failed_orders_thread(days: int = 30):
 
 def check_retry_window_expired(task_id: str) -> bool:
     """
-    Check if the retry window (30 days) has expired for a failed order.
+    Check if the retry window (2 days) has expired for a failed order.
     Returns True if the order should stop being retried.
     """
     try:
@@ -575,14 +575,14 @@ def check_retry_window_expired(task_id: str) -> bool:
                 current_time - first_failure_time
             ).total_seconds() / (24 * 3600)
 
-            if days_since_first_failure >= 30:
+            if days_since_first_failure >= 2:
                 db_logger.info(
                     f"Retry window expired for task_id: {task_id} (failed for {days_since_first_failure:.1f} days)"
                 )
                 return True
 
             db_logger.info(
-                f"Retry window active for task_id: {task_id} ({days_since_first_failure:.1f}/30 days)"
+                f"Retry window active for task_id: {task_id} ({days_since_first_failure:.1f}/2 days)"
             )
             return False
     except Exception as e:
@@ -689,16 +689,16 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
     """Execute a single HTTP request with error handling and auto-retry"""
 
 
-    # Check if 30-day retry window has expired
+    # Check if 2-day retry window has expired
     retry_window_expired = await ctx.run_typed(
         "check_retry_window",
         lambda: check_retry_window_expired(request.task_id),
     )
 
     if retry_window_expired:
-        # Delete the order and stop retrying after 30 days
+        # Delete the order and stop retrying after 2 days
         db_logger.info(
-            f"30-day retry window expired for task_id: {request.task_id}. Deleting order and stopping retries."
+            f"2-day retry window expired for task_id: {request.task_id}. Deleting order and stopping retries."
         )
         await delete_successful_order_from_db(ctx, request.task_id, request)
         # Return success to stop Restate from retrying
@@ -708,7 +708,7 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
             status_code=0,
             response_data={},
             success=True,
-            error="Retry window expired (30 days), order removed from database",
+            error="Retry window expired (2 days), order removed from database",
         ).model_dump()
 
     async def make_http_request():
@@ -1237,7 +1237,7 @@ async def send_single_email(ctx: Context) -> Dict[str, str]:
 
 @batch_service.handler("cleanup_old_failed_orders")
 async def cleanup_old_failed_orders(
-    ctx: Context, days: int = 30
+    ctx: Context, days: int = 2
 ) -> Dict[str, str]:
     """
     Cleanup orders that have failed and are older than the retention period.
@@ -1245,7 +1245,7 @@ async def cleanup_old_failed_orders(
     old failed invocations that are no longer being retried.
 
     Args:
-        days: Number of days to retain failed orders (default: 30)
+        days: Number of days to retain failed orders (default: 2)
 
     Returns:
         Status message with count of deleted orders
@@ -1266,5 +1266,9 @@ if __name__ == "__main__":
     config = hypercorn.config.Config()
     config.bind = ["0.0.0.0:9080"]
     config.alpn_protocols = ["http/1.1"]
+    # Disable Hypercorn's default logging to prevent duplicate logs
+    # Our logging is already configured via logging.basicConfig()
+    config.accesslog = None  # Disable access logs
+    config.errorlog = None   # Disable error logs (prevents duplicate logging)
 
     asyncio.run(hypercorn.asyncio.serve(application, config))
