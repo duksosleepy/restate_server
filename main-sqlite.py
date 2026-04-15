@@ -17,8 +17,10 @@ from pydantic import BaseModel
 from restate import (
     Context,
     InvocationRetryPolicy,
+    ObjectContext,
     Service,
     TerminalError,
+    VirtualObject,
     app,
 )
 
@@ -94,9 +96,6 @@ class DatabaseManager:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_orders_product_code ON orders(product_code)"
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_non_existing_codes_product ON non_existing_codes(product_code)"
-            )
 
             conn.commit()
             db_logger.info(
@@ -147,6 +146,7 @@ class HttpResponse(BaseModel):
     success: bool
     error: Optional[str] = None
     needs_manual_retry: bool = False
+    non_existing_codes: list[str] = []  # List of unique product codes that don't exist in system
 
 
 http_task = Service(
@@ -160,8 +160,6 @@ http_task = Service(
     ),
 )
 
-# Thread-safe set for deduplication (used as cache, DB is source of truth)
-non_existing_codes_cache: set = set()
 
 
 def query_from_thread(query_func, *args):
@@ -222,66 +220,6 @@ def update_daily_stats_thread(
         raise
 
 
-def insert_non_existing_code_thread(product_code: str, order_id: str):
-    """Thread function to insert non-existing product code into database"""
-    try:
-        with db_manager.execute_query() as conn:
-            # Use INSERT OR IGNORE to handle duplicates gracefully
-            # email_sent defaults to 0 (not sent)
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO non_existing_codes (product_code, order_id, email_sent)
-                VALUES (?, ?, 0)
-            """,
-                (product_code, order_id),
-            )
-    except Exception as e:
-        db_logger.error(
-            f"Error inserting non-existing code {product_code}: {str(e)}"
-        )
-        raise
-
-
-def get_unsent_non_existing_codes_thread() -> list:
-    """Get all non-existing codes that haven't been sent via email yet"""
-    try:
-        with db_manager.execute_query() as conn:
-            cursor = conn.execute(
-                """
-                SELECT DISTINCT product_code FROM non_existing_codes
-                WHERE email_sent = 0
-                ORDER BY created_at ASC
-            """
-            )
-            codes = [row[0] for row in cursor.fetchall()]
-            return codes
-    except Exception as e:
-        db_logger.error(f"Error fetching unsent non-existing codes: {str(e)}")
-        raise
-
-
-def mark_codes_as_sent_thread(codes: list) -> int:
-    """Mark the given product codes as sent in the database"""
-    if not codes:
-        return 0
-
-    try:
-        with db_manager.execute_query() as conn:
-            # Use parameterized query with placeholders for each code
-            placeholders = ",".join("?" * len(codes))
-            conn.execute(
-                f"""
-                UPDATE non_existing_codes
-                SET email_sent = 1
-                WHERE product_code IN ({placeholders}) AND email_sent = 0
-            """,
-                codes,
-            )
-            updated_count = conn.total_changes
-            return updated_count
-    except Exception as e:
-        db_logger.error(f"Error marking codes as sent: {str(e)}")
-        raise
 
 
 def insert_order_thread(request: HttpRequest, response: HttpResponse):
@@ -598,13 +536,6 @@ def delete_order_thread(task_id: str, request: HttpRequest = None):
             # Delete from orders table
             conn.execute("DELETE FROM orders WHERE order_id = ?", (task_id,))
 
-            # Delete ALL non_existing_codes associated with this order
-            # Multiple codes may have been inserted when the order failed with product code errors
-            conn.execute(
-                "DELETE FROM non_existing_codes WHERE order_id = ?",
-                (task_id,),
-            )
-
         return f"Deleted successful order {task_id} from database"
     except Exception as e:
         db_logger.error(f"Error deleting order {task_id}: {str(e)}")
@@ -851,16 +782,21 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
                         needs_manual_retry=False,
                     ).model_dump()
 
-                # Extract non-existing product codes
+                # Extract ALL non-existing product codes from error message
+                # Pattern matches: "Mã hàng <code> không tồn tại trong hệ thống"
+                # Can appear multiple times in one error message
                 pattern = r"Mã hàng\s+([^\s]+(?:\s+[^\s]+)*?)\s+không tồn tại trong hệ thống"
                 matches = re.findall(pattern, error_code)
 
-                for code in matches:
-                    query_from_thread(
-                        insert_non_existing_code_thread, code, request.task_id
+                # Store extracted codes in response (will be deduplicated later in submit_batch)
+                if matches:
+                    # Convert to list of unique codes
+                    unique_codes = list(set(matches))
+                    response.non_existing_codes = unique_codes
+                    db_logger.info(
+                        f"Extracted {len(unique_codes)} unique non-existing product codes "
+                        f"from error for task_id: {request.task_id}: {unique_codes}"
                     )
-                    # Add to cache set (automatically handles duplicates)
-                    non_existing_codes_cache.add(code)
 
                 # Ensure proper UTF-8 encoding
                 try:
@@ -941,6 +877,144 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
     raise Exception("Unexpected error in execute_request handler")
 
 
+# Virtual Object for managing non-existing codes accumulation and debounced email
+email_accumulator = VirtualObject("EmailAccumulator")
+
+
+@email_accumulator.handler()
+async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
+    """
+    Add product codes to the accumulator and schedule delayed email send.
+
+    Uses debouncing: schedules email 5 minutes from now. If more codes arrive
+    before email is sent, they're accumulated and the email still goes out on schedule.
+
+    Resets accumulator automatically at the start of each new day.
+
+    Args:
+        codes: List of non-existing product codes to add
+
+    Returns:
+        Status dict
+    """
+    if not codes:
+        return {"status": "no_codes", "count": 0}
+
+    # Check if we're in a new day - if so, reset the accumulator
+    current_date = datetime.now().date().isoformat()
+    last_date = await ctx.get("last_date")
+
+    if last_date != current_date:
+        # New day detected - reset accumulator
+        db_logger.info(f"New day detected ({current_date}), resetting accumulator from previous day ({last_date})")
+        await ctx.clear("codes")
+        await ctx.clear("email_scheduled")
+        await ctx.set("last_date", current_date)
+
+    # Get current accumulated codes from durable state
+    accumulated_codes = await ctx.get("codes") or set()
+
+    # Add new codes to accumulator (set ensures uniqueness)
+    accumulated_codes.update(codes)
+
+    # Save back to durable state
+    await ctx.set("codes", accumulated_codes)
+
+    db_logger.info(
+        f"Added {len(codes)} codes to accumulator for {current_date}. "
+        f"Total accumulated: {len(accumulated_codes)}"
+    )
+
+    # Check if email is already scheduled
+    email_scheduled = await ctx.get("email_scheduled") or False
+
+    if not email_scheduled:
+        # Schedule delayed email send (5 minutes from now)
+        db_logger.info("Scheduling email send in 5 minutes...")
+
+        # Mark email as scheduled
+        await ctx.set("email_scheduled", True)
+
+        # Send delayed message to ourselves to trigger email after 5 minutes
+        ctx.object_send(
+            send_accumulated_email,
+            key=ctx.key(),
+            arg=None,
+            send_delay=timedelta(minutes=5),
+        )
+
+        return {
+            "status": "scheduled",
+            "accumulated_count": len(accumulated_codes),
+            "date": current_date,
+            "message": "Email scheduled for 5 minutes from now"
+        }
+    else:
+        return {
+            "status": "accumulating",
+            "accumulated_count": len(accumulated_codes),
+            "date": current_date,
+            "message": "Codes added to existing accumulator, email already scheduled"
+        }
+
+
+@email_accumulator.handler()
+async def send_accumulated_email(ctx: ObjectContext) -> Dict[str, Any]:
+    """
+    Send email with all accumulated codes and reset the accumulator.
+    Called automatically after 5-minute delay.
+
+    Note: Does NOT clear last_date - this allows proper new day detection.
+    """
+    # Get accumulated codes
+    accumulated_codes = await ctx.get("codes") or set()
+    current_date = await ctx.get("last_date") or datetime.now().date().isoformat()
+
+    if not accumulated_codes:
+        db_logger.info("No accumulated codes to send")
+        # Reset the scheduled flag
+        await ctx.clear("email_scheduled")
+        return {"status": "no_codes", "count": 0, "date": current_date}
+
+    # Convert to sorted list for email
+    codes_list = sorted(list(accumulated_codes))
+
+    db_logger.info(f"Sending email with {len(codes_list)} accumulated codes for date {current_date}...")
+
+    # Send email
+    email_result = await ctx.run(
+        "send_email",
+        lambda: send_non_existing_codes_email_sync(codes_list),
+    )
+
+    if email_result["status"] == "sent":
+        db_logger.info(f"Email sent successfully with {email_result['count']} codes")
+
+        # Clear the accumulator and scheduled flag after successful send
+        # Keep last_date to track which day we're on
+        await ctx.clear("codes")
+        await ctx.clear("email_scheduled")
+
+        return {
+            "status": "sent",
+            "count": email_result["count"],
+            "date": current_date,
+            "message": f"Email sent with {email_result['count']} codes for {current_date}"
+        }
+    else:
+        db_logger.error(f"Email send failed: {email_result.get('error', 'unknown')}")
+
+        # Don't clear accumulator if email failed - will retry on next batch
+        await ctx.clear("email_scheduled")
+
+        return {
+            "status": "failed",
+            "error": email_result.get("error", "unknown"),
+            "count": 0,
+            "date": current_date
+        }
+
+
 # Service for batch management
 batch_service = restate.Service("BatchService")
 
@@ -1006,18 +1080,16 @@ def generate_excel_file(codes: list) -> str:
     return filename
 
 
-def send_non_existing_codes_email_sync(codes: list = None) -> dict:
+def send_non_existing_codes_email_sync(codes: list) -> dict:
     """
     Send email with the list of non-existing codes and Excel attachment.
 
     Args:
-        codes: List of codes to send. If None, fetches unsent codes from database.
+        codes: List of codes to send.
 
     Returns:
         dict with status and count of codes sent
     """
-    global non_existing_codes_cache
-
     try:
         import smtplib
         from email import encoders
@@ -1025,12 +1097,9 @@ def send_non_existing_codes_email_sync(codes: list = None) -> dict:
         from email.mime.multipart import MIMEMultipart
         from email.mime.text import MIMEText
 
-        # If no codes provided, fetch unsent codes from database
-        if codes is None:
-            codes = get_unsent_non_existing_codes_thread()
-
+        # If no codes provided, return early
         if not codes:
-            db_logger.info("No unsent codes to email")
+            db_logger.info("No codes to email")
             return {"status": "no_codes", "count": 0}
 
         # Email configuration from environment variables
@@ -1088,12 +1157,6 @@ def send_non_existing_codes_email_sync(codes: list = None) -> dict:
         )
         server.quit()
 
-        # Mark codes as sent in database AFTER successful email
-        mark_codes_as_sent_thread(codes)
-
-        # Clear in-memory cache
-        non_existing_codes_cache.clear()
-
         # Clean up Excel file after sending
         try:
             os.remove(excel_filename)
@@ -1134,6 +1197,8 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     task_ids = []
     errors = []
     successful_count = 0
+    # Accumulate all non-existing product codes from all requests in batch
+    all_non_existing_codes = set()
 
     # Process requests sequentially (one at a time)
     for req_data in requests:
@@ -1154,6 +1219,15 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         # Execute request sequentially - await immediately before processing next request
         try:
             response_dict = await ctx.service_call(execute_request, request)
+
+            # Collect non-existing product codes from response
+            codes_from_response = response_dict.get("non_existing_codes", [])
+            if codes_from_response:
+                all_non_existing_codes.update(codes_from_response)
+                db_logger.info(
+                    f"Collected {len(codes_from_response)} codes from task_id {task_id}, "
+                    f"total accumulated: {len(all_non_existing_codes)}"
+                )
 
             # Check success from dict directly
             if response_dict.get("success", False):
@@ -1179,19 +1253,29 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
                 }
             )
 
-    # Send email with non-existing codes immediately after processing all orders
-    db_logger.info("Checking for non-existing codes to email...")
-    email_result = await ctx.run_typed(
-        "send_non_existing_codes_email",
-        lambda: query_from_thread(send_non_existing_codes_email_sync, None),
+    # Send codes to EmailAccumulator Virtual Object for debounced email sending
+    db_logger.info(
+        f"Batch processing complete. Total unique non-existing codes collected: {len(all_non_existing_codes)}"
     )
 
-    if email_result["status"] == "sent":
-        db_logger.info(f"Email sent with {email_result['count']} non-existing codes")
-    elif email_result["status"] == "no_codes":
-        db_logger.info("No non-existing codes to email")
+    accumulator_result = {"status": "no_codes", "count": 0}
+    if all_non_existing_codes:
+        # Convert set to list
+        codes_list = list(all_non_existing_codes)
+        db_logger.info(
+            f"Sending {len(codes_list)} codes to EmailAccumulator (will send email after 5-minute debounce)..."
+        )
+
+        # Send to Virtual Object accumulator using a fixed key (all batches share same accumulator)
+        accumulator_result = await ctx.object_call(
+            add_codes,
+            key="global",  # Use single global accumulator for all batches
+            arg=codes_list,
+        )
+
+        db_logger.info(f"Accumulator response: {accumulator_result}")
     else:
-        db_logger.error(f"Failed to send non-existing codes email: {email_result.get('error', 'unknown')}")
+        db_logger.info("No non-existing codes found in this batch")
 
     # Return response with processing results
     batch_status_message = ""
@@ -1210,27 +1294,10 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         "errors": errors if errors else None,
         "batch_status": "all_succeeded" if not errors else "some_failed",
         "status_details": batch_status_message,
-        "email_result": email_result,
+        "accumulator_result": accumulator_result,
     }
 
 
-@batch_service.handler("send_single_email")
-async def send_single_email(ctx: Context) -> Dict[str, str]:
-    """Send a single email with non-existing codes from database"""
-    # Send email using database as source of truth
-    result = await ctx.run_typed(
-        "send_non_existing_codes_email",
-        lambda: query_from_thread(send_non_existing_codes_email_sync, None),
-    )
-
-    if result["status"] == "sent":
-        return {
-            "message": f"Email sent with {result['count']} codes"
-        }
-    elif result["status"] == "no_codes":
-        return {"message": "No unsent codes to send"}
-    else:
-        return {"message": f"Email failed: {result.get('error', 'unknown error')}"}
 
 
 
@@ -1257,7 +1324,7 @@ async def cleanup_old_failed_orders(
     return {"message": result}
 
 
-application = app(services=[batch_service, http_task])
+application = app(services=[batch_service, http_task, email_accumulator])
 
 if __name__ == "__main__":
     import hypercorn.asyncio

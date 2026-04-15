@@ -36,15 +36,6 @@ CREATE TABLE IF NOT EXISTS daily_task_stats (
     last_updated TEXT NOT NULL
 );
 
--- Non-existing product codes tracking
-CREATE TABLE IF NOT EXISTS non_existing_codes (
-    product_code TEXT NOT NULL,
-    order_id TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now')),
-    email_sent INTEGER DEFAULT 0,  -- 0 = not sent, 1 = sent
-    PRIMARY KEY (product_code, order_id)
-);
-
 -- Performance indexes for fast queries
 -- Index on order_id for quick lookups
 CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id);
@@ -60,12 +51,6 @@ CREATE INDEX IF NOT EXISTS idx_orders_first_failure ON orders(first_failure_time
 
 -- Index on product_code for product-related queries
 CREATE INDEX IF NOT EXISTS idx_orders_product_code ON orders(product_code);
-
--- Index on product_code in non_existing_codes for faster lookups
-CREATE INDEX IF NOT EXISTS idx_non_existing_codes_product ON non_existing_codes(product_code);
-
--- Index on email_sent for querying unsent codes
-CREATE INDEX IF NOT EXISTS idx_non_existing_codes_email_sent ON non_existing_codes(email_sent);
 
 -- Enable WAL mode for better concurrency (recommended for SQLite)
 PRAGMA journal_mode=WAL;
