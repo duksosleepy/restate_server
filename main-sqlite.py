@@ -155,8 +155,8 @@ http_task = Service(
         initial_interval=timedelta(minutes=15),
         exponentiation_factor=2.0,
         max_interval=timedelta(hours=24),  # Cap at 24 hours between retries
-        max_attempts=None,  # Unlimited attempts
-        on_max_attempts=None,
+        max_attempts=100,  # Allow up to 100 retry attempts
+        on_max_attempts='pause',  # Pause invocation instead of killing it after max attempts
     ),
 )
 
