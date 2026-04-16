@@ -847,28 +847,34 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
             lambda: query_from_thread(update_daily_stats_thread, False, True),
         )
 
-        # Determine if this error is retryable or terminal
+        # For terminal errors (4xx), return the response with codes
         # Client errors (4xx) are terminal - the request is invalid and won't succeed on retry
-        # Server errors (5xx) are retryable - the server may recover
+        # Server errors (5xx) are retryable - schedule a retry via delayed send
         if response.status_code in [400, 401, 403, 404]:
-            # Terminal error - do not retry
+            # Terminal error - do not retry, but return response with codes
             db_logger.warning(
                 f"HttpTask failed with terminal error for task_id: {request.task_id}, "
-                f"status_code: {response.status_code}, not retrying (client error)"
+                f"status_code: {response.status_code}, returning response with codes"
             )
-            raise TerminalError(
-                f"HTTP request failed: {response.error} (status_code: {response.status_code})"
-            )
+            # Return the response dict (includes non_existing_codes)
+            return response.model_dump()
         else:
-            # Retryable error - raise regular exception to trigger retry
-            # according to InvocationRetryPolicy (15-minute intervals)
+            # Retryable error (5xx) - schedule delayed retry instead of raising exception
+            # This allows the current invocation to complete so submit_batch can continue
             db_logger.warning(
-                f"HttpTask failed for task_id: {request.task_id}, "
-                f"status_code: {response.status_code}, raising exception to retry invocation"
+                f"HttpTask failed with retryable error for task_id: {request.task_id}, "
+                f"status_code: {response.status_code}, scheduling retry in 15 minutes"
             )
-            raise Exception(
-                f"HTTP request failed: {response.error} (status_code: {response.status_code})"
+
+            # Schedule a delayed retry
+            ctx.service_send(
+                execute_request,
+                request,
+                send_delay=timedelta(minutes=15)
             )
+
+            # Return response indicating retry is scheduled
+            return response.model_dump()
 
     # Should never reach here - all paths above either return or raise
     db_logger.error(
@@ -1242,16 +1248,22 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
                     }
                 )
         except Exception as e:
-            # Catch any unexpected errors during service call
-            db_logger.error(f"Error executing request for task_id {task_id}: {str(e)}")
+            # Exception from execute_request (500 error that needs retry)
+            # The execute_request invocation will retry independently according to its retry policy
+            # We continue processing other requests in the batch
+            db_logger.warning(
+                f"execute_request failed for task_id {task_id}: {str(e)} "
+                f"- this invocation will retry independently (next retry in 15 min)"
+            )
             errors.append(
                 {
                     "task_id": task_id,
-                    "error": str(e),
+                    "error": f"Retrying: {str(e)}",
                     "status_code": 0,
                     "response_data": {},
                 }
             )
+            # Continue with next request - don't re-raise
 
     # Send codes to EmailAccumulator Virtual Object for debounced email sending
     db_logger.info(
