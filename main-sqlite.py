@@ -917,14 +917,15 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
         ctx.clear("email_scheduled")
         ctx.set("last_date", current_date)
 
-    # Get current accumulated codes from durable state
-    accumulated_codes = await ctx.get("codes") or set()
+    # Get current accumulated codes from durable state (stored as list)
+    accumulated_codes_list = await ctx.get("codes") or []
 
-    # Add new codes to accumulator (set ensures uniqueness)
+    # Convert to set for deduplication, add new codes, convert back to list
+    accumulated_codes = set(accumulated_codes_list)
     accumulated_codes.update(codes)
 
-    # Save back to durable state
-    ctx.set("codes", accumulated_codes)
+    # Save back to durable state as list (JSON serializable)
+    ctx.set("codes", list(accumulated_codes))
 
     db_logger.info(
         f"Added {len(codes)} codes to accumulator for {current_date}. "
@@ -972,8 +973,8 @@ async def send_accumulated_email(ctx: ObjectContext) -> Dict[str, Any]:
 
     Note: Does NOT clear last_date - this allows proper new day detection.
     """
-    # Get accumulated codes
-    accumulated_codes = await ctx.get("codes") or set()
+    # Get accumulated codes (stored as list)
+    accumulated_codes = await ctx.get("codes") or []
     current_date = await ctx.get("last_date") or datetime.now().date().isoformat()
 
     if not accumulated_codes:
@@ -982,8 +983,8 @@ async def send_accumulated_email(ctx: ObjectContext) -> Dict[str, Any]:
         ctx.clear("email_scheduled")
         return {"status": "no_codes", "count": 0, "date": current_date}
 
-    # Convert to sorted list for email
-    codes_list = sorted(list(accumulated_codes))
+    # Convert to sorted list for email (already a list, just sort it)
+    codes_list = sorted(accumulated_codes)
 
     db_logger.info(f"Sending email with {len(codes_list)} accumulated codes for date {current_date}...")
 
