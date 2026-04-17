@@ -908,7 +908,7 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
 
     # Check if we're in a new day - if so, reset the accumulator
     current_date = datetime.now().date().isoformat()
-    last_date = ctx.get("last_date")
+    last_date = await ctx.get("last_date")
 
     if last_date != current_date:
         # New day detected - reset accumulator
@@ -918,7 +918,7 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
         ctx.set("last_date", current_date)
 
     # Get current accumulated codes from durable state
-    accumulated_codes = ctx.get("codes") or set()
+    accumulated_codes = await ctx.get("codes") or set()
 
     # Add new codes to accumulator (set ensures uniqueness)
     accumulated_codes.update(codes)
@@ -932,7 +932,7 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
     )
 
     # Check if email is already scheduled
-    email_scheduled = ctx.get("email_scheduled") or False
+    email_scheduled = await ctx.get("email_scheduled") or False
 
     if not email_scheduled:
         # Schedule delayed email send (5 minutes from now)
@@ -973,8 +973,8 @@ async def send_accumulated_email(ctx: ObjectContext) -> Dict[str, Any]:
     Note: Does NOT clear last_date - this allows proper new day detection.
     """
     # Get accumulated codes
-    accumulated_codes = ctx.get("codes") or set()
-    current_date = ctx.get("last_date") or datetime.now().date().isoformat()
+    accumulated_codes = await ctx.get("codes") or set()
+    current_date = await ctx.get("last_date") or datetime.now().date().isoformat()
 
     if not accumulated_codes:
         db_logger.info("No accumulated codes to send")
