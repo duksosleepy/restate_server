@@ -908,23 +908,23 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
 
     # Check if we're in a new day - if so, reset the accumulator
     current_date = datetime.now().date().isoformat()
-    last_date = await ctx.get("last_date")
+    last_date = ctx.get("last_date")
 
     if last_date != current_date:
         # New day detected - reset accumulator
         db_logger.info(f"New day detected ({current_date}), resetting accumulator from previous day ({last_date})")
-        await ctx.clear("codes")
-        await ctx.clear("email_scheduled")
-        await ctx.set("last_date", current_date)
+        ctx.clear("codes")
+        ctx.clear("email_scheduled")
+        ctx.set("last_date", current_date)
 
     # Get current accumulated codes from durable state
-    accumulated_codes = await ctx.get("codes") or set()
+    accumulated_codes = ctx.get("codes") or set()
 
     # Add new codes to accumulator (set ensures uniqueness)
     accumulated_codes.update(codes)
 
     # Save back to durable state
-    await ctx.set("codes", accumulated_codes)
+    ctx.set("codes", accumulated_codes)
 
     db_logger.info(
         f"Added {len(codes)} codes to accumulator for {current_date}. "
@@ -932,14 +932,14 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
     )
 
     # Check if email is already scheduled
-    email_scheduled = await ctx.get("email_scheduled") or False
+    email_scheduled = ctx.get("email_scheduled") or False
 
     if not email_scheduled:
         # Schedule delayed email send (5 minutes from now)
         db_logger.info("Scheduling email send in 5 minutes...")
 
         # Mark email as scheduled
-        await ctx.set("email_scheduled", True)
+        ctx.set("email_scheduled", True)
 
         # Send delayed message to ourselves to trigger email after 5 minutes
         ctx.object_send(
@@ -973,13 +973,13 @@ async def send_accumulated_email(ctx: ObjectContext) -> Dict[str, Any]:
     Note: Does NOT clear last_date - this allows proper new day detection.
     """
     # Get accumulated codes
-    accumulated_codes = await ctx.get("codes") or set()
-    current_date = await ctx.get("last_date") or datetime.now().date().isoformat()
+    accumulated_codes = ctx.get("codes") or set()
+    current_date = ctx.get("last_date") or datetime.now().date().isoformat()
 
     if not accumulated_codes:
         db_logger.info("No accumulated codes to send")
         # Reset the scheduled flag
-        await ctx.clear("email_scheduled")
+        ctx.clear("email_scheduled")
         return {"status": "no_codes", "count": 0, "date": current_date}
 
     # Convert to sorted list for email
@@ -998,8 +998,8 @@ async def send_accumulated_email(ctx: ObjectContext) -> Dict[str, Any]:
 
         # Clear the accumulator and scheduled flag after successful send
         # Keep last_date to track which day we're on
-        await ctx.clear("codes")
-        await ctx.clear("email_scheduled")
+        ctx.clear("codes")
+        ctx.clear("email_scheduled")
 
         return {
             "status": "sent",
@@ -1011,7 +1011,7 @@ async def send_accumulated_email(ctx: ObjectContext) -> Dict[str, Any]:
         db_logger.error(f"Email send failed: {email_result.get('error', 'unknown')}")
 
         # Don't clear accumulator if email failed - will retry on next batch
-        await ctx.clear("email_scheduled")
+        ctx.clear("email_scheduled")
 
         return {
             "status": "failed",
