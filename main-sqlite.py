@@ -619,29 +619,6 @@ def purge_batch_invocation(invocation_id: str) -> str:
 async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
     """Execute a single HTTP request with error handling and auto-retry"""
 
-
-    # Check if 2-day retry window has expired
-    retry_window_expired = await ctx.run_typed(
-        "check_retry_window",
-        lambda: check_retry_window_expired(request.task_id),
-    )
-
-    if retry_window_expired:
-        # Delete the order and stop retrying after 2 days
-        db_logger.info(
-            f"2-day retry window expired for task_id: {request.task_id}. Deleting order and stopping retries."
-        )
-        await delete_successful_order_from_db(ctx, request.task_id, request)
-        # Return success to stop Restate from retrying
-        return HttpResponse(
-            task_id=request.task_id,
-            url=request.url,
-            status_code=0,
-            response_data={},
-            success=True,
-            error="Retry window expired (2 days), order removed from database",
-        ).model_dump()
-
     async def make_http_request():
         try:
             async with httpx.AsyncClient() as client:
@@ -702,28 +679,9 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
     # Convert dict back to HttpResponse object
     response = HttpResponse(**response_dict)
 
-    # Handle success case - delete from database and update stats
+    # Handle success case
     if response.success:
-        try:
-            await delete_successful_order_from_db(ctx, request.task_id, request)
-        except Exception as e:
-            db_logger.error(
-                f"Error deleting order from DB for task_id: {request.task_id}: {str(e)}"
-            )
-            # Continue anyway - the HTTP request succeeded
-
-        try:
-            # Update daily stats for completed task
-            await ctx.run_typed(
-                "update_daily_stats_completed",
-                lambda: query_from_thread(update_daily_stats_thread, True, False),
-            )
-        except Exception as e:
-            db_logger.error(
-                f"Error updating daily stats for task_id: {request.task_id}: {str(e)}"
-            )
-            # Continue anyway - the HTTP request succeeded
-
+        db_logger.info(f"HTTP request succeeded for task_id: {request.task_id}")
         # Return the success response to complete the invocation
         return response.model_dump()
 
@@ -743,30 +701,7 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
                 # Check for duplicate document pattern first
                 duplicate_pattern = r"Chứng từ\s+.+?\s+đã nhập\."
                 if re.search(duplicate_pattern, error_code):
-                    # Duplicate document - treat as success, delete and complete
-                    try:
-                        await delete_successful_order_from_db(
-                            ctx, request.task_id, request
-                        )
-                    except Exception as e:
-                        db_logger.error(
-                            f"Error deleting duplicate order for task_id: {request.task_id}: {str(e)}"
-                        )
-                        # Continue anyway
-
-                    try:
-                        await ctx.run_typed(
-                            "update_daily_stats_completed",
-                            lambda: query_from_thread(
-                                update_daily_stats_thread, True, False
-                            ),
-                        )
-                    except Exception as e:
-                        db_logger.error(
-                            f"Error updating stats for duplicate task_id: {request.task_id}: {str(e)}"
-                        )
-                        # Continue anyway
-
+                    # Duplicate document - treat as success
                     db_logger.info(
                         f"Duplicate document detected for task_id: {request.task_id}, "
                         f"treating as success"
@@ -778,7 +713,7 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
                         status_code=response.status_code,
                         response_data=response.response_data,
                         success=True,
-                        error=f"Duplicate document detected and removed: {error_code}",
+                        error=f"Duplicate document detected: {error_code}",
                         needs_manual_retry=False,
                     ).model_dump()
 
@@ -788,11 +723,15 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
                 pattern = r"Mã hàng\s+([^\s]+(?:\s+[^\s]+)*?)\s+không tồn tại trong hệ thống"
                 matches = re.findall(pattern, error_code)
 
+                # Flag to track if this error has non-existing product codes
+                has_non_existing_codes = False
+
                 # Store extracted codes in response (will be deduplicated later in submit_batch)
                 if matches:
                     # Convert to list of unique codes
                     unique_codes = list(set(matches))
                     response.non_existing_codes = unique_codes
+                    has_non_existing_codes = True
                     db_logger.info(
                         f"Extracted {len(unique_codes)} unique non-existing product codes "
                         f"from error for task_id: {request.task_id}: {unique_codes}"
@@ -809,72 +748,67 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
                 except (UnicodeDecodeError, UnicodeEncodeError):
                     pass
 
-            # Log failed order to database
-            await log_failed_order_to_db(ctx, request, response)
+            # Log failed order (database operation removed)
+            db_logger.info(f"Failed order logged for task_id: {request.task_id}")
         else:
             # Empty errorCode means successful HTTP request - treat as success
-            # Delete the successful order from database
-            try:
-                await delete_successful_order_from_db(ctx, request.task_id, request)
-            except Exception as e:
-                db_logger.error(
-                    f"Error deleting order for empty errorCode task_id: {request.task_id}: {str(e)}"
-                )
-                # Continue anyway
-
-            try:
-                await ctx.run_typed(
-                    "update_daily_stats_completed",
-                    lambda: query_from_thread(
-                        update_daily_stats_thread, True, False
-                    ),
-                )
-            except Exception as e:
-                db_logger.error(
-                    f"Error updating stats for empty errorCode task_id: {request.task_id}: {str(e)}"
-                )
-                # Continue anyway
-
             db_logger.info(
                 f"Empty errorCode for task_id: {request.task_id}, treating as success"
             )
             # Return success to complete the invocation
             return response.model_dump()
 
-        # Update daily stats for failed task
-        await ctx.run_typed(
-            "update_daily_stats_failed",
-            lambda: query_from_thread(update_daily_stats_thread, False, True),
-        )
+        # Determine if we should retry based on error type:
+        # 1. Non-existing product code errors (has_non_existing_codes) → RETRY
+        # 2. Server errors (5xx) → RETRY
+        # 3. Other client errors (400/401/403/404 without product codes) → NO RETRY (terminal)
 
-        # For terminal errors (4xx), return the response with codes
-        # Client errors (4xx) are terminal - the request is invalid and won't succeed on retry
-        # Server errors (5xx) are retryable - schedule a retry via delayed send
-        if response.status_code in [400, 401, 403, 404]:
-            # Terminal error - do not retry, but return response with codes
+        # First, send codes to EmailAccumulator if we extracted any
+        # This must happen BEFORE raising exception
+        if has_non_existing_codes and response.non_existing_codes:
+            try:
+                db_logger.info(
+                    f"Sending {len(response.non_existing_codes)} codes to EmailAccumulator "
+                    f"before retry for task_id: {request.task_id}"
+                )
+                await ctx.object_call(
+                    add_codes,
+                    key="global",
+                    arg=response.non_existing_codes,
+                )
+            except Exception as e:
+                db_logger.error(
+                    f"Failed to send codes to EmailAccumulator for task_id {request.task_id}: {str(e)}"
+                )
+                # Continue anyway - we'll raise the retry exception
+
+        # Now determine retry behavior
+        if has_non_existing_codes:
+            # Product code error - raise exception to trigger Restate retry
+            db_logger.warning(
+                f"HttpTask failed with non-existing product code error for task_id: {request.task_id}, "
+                f"raising exception to trigger retry (next retry in 15 min)"
+            )
+            raise Exception(
+                f"Non-existing product code error: {response.error} (status_code: {response.status_code})"
+            )
+        elif response.status_code in [400, 401, 403, 404]:
+            # Other 4xx errors (duplicate, auth, etc.) - terminal, no retry
             db_logger.warning(
                 f"HttpTask failed with terminal error for task_id: {request.task_id}, "
-                f"status_code: {response.status_code}, returning response with codes"
+                f"status_code: {response.status_code}, completing without retry"
             )
-            # Return the response dict (includes non_existing_codes)
+            # Return response to complete invocation
             return response.model_dump()
         else:
-            # Retryable error (5xx) - schedule delayed retry instead of raising exception
-            # This allows the current invocation to complete so submit_batch can continue
+            # 5xx server errors - raise exception to trigger retry
             db_logger.warning(
-                f"HttpTask failed with retryable error for task_id: {request.task_id}, "
-                f"status_code: {response.status_code}, scheduling retry in 15 minutes"
+                f"HttpTask failed with server error for task_id: {request.task_id}, "
+                f"status_code: {response.status_code}, raising exception to trigger retry"
             )
-
-            # Schedule a delayed retry
-            ctx.service_send(
-                execute_request,
-                request,
-                send_delay=timedelta(minutes=15)
+            raise Exception(
+                f"HTTP request failed: {response.error} (status_code: {response.status_code})"
             )
-
-            # Return response indicating retry is scheduled
-            return response.model_dump()
 
     # Should never reach here - all paths above either return or raise
     db_logger.error(
@@ -892,8 +826,8 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
     """
     Add product codes to the accumulator and schedule delayed email send.
 
-    Uses debouncing: schedules email 5 minutes from now. If more codes arrive
-    before email is sent, they're accumulated and the email still goes out on schedule.
+    Only ONE email is sent per day - the first time codes are added.
+    Subsequent calls accumulate codes but don't schedule new emails.
 
     Resets accumulator automatically at the start of each new day.
 
@@ -911,10 +845,11 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
     last_date = await ctx.get("last_date")
 
     if last_date != current_date:
-        # New day detected - reset accumulator
+        # New day detected - reset accumulator and email sent flag
         db_logger.info(f"New day detected ({current_date}), resetting accumulator from previous day ({last_date})")
         ctx.clear("codes")
         ctx.clear("email_scheduled")
+        ctx.clear("email_sent_today")  # Reset the daily email flag
         ctx.set("last_date", current_date)
 
     # Get current accumulated codes from durable state (stored as list)
@@ -931,6 +866,21 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
         f"Added {len(codes)} codes to accumulator for {current_date}. "
         f"Total accumulated: {len(accumulated_codes)}"
     )
+
+    # Check if email was already sent today
+    email_sent_today = await ctx.get("email_sent_today") or False
+
+    if email_sent_today:
+        # Email already sent today - just accumulate codes, don't schedule new email
+        db_logger.info(
+            f"Email already sent today ({current_date}), accumulating codes without scheduling new email"
+        )
+        return {
+            "status": "accumulated_no_email",
+            "accumulated_count": len(accumulated_codes),
+            "date": current_date,
+            "message": "Codes accumulated, but email already sent today"
+        }
 
     # Check if email is already scheduled
     email_scheduled = await ctx.get("email_scheduled") or False
@@ -997,10 +947,19 @@ async def send_accumulated_email(ctx: ObjectContext) -> Dict[str, Any]:
     if email_result["status"] == "sent":
         db_logger.info(f"Email sent successfully with {email_result['count']} codes")
 
+        # Mark that email was sent today to prevent scheduling another email
+        ctx.set("email_sent_today", True)
+
         # Clear the accumulator and scheduled flag after successful send
         # Keep last_date to track which day we're on
+        # Keep email_sent_today to prevent scheduling new emails today
         ctx.clear("codes")
         ctx.clear("email_scheduled")
+
+        db_logger.info(
+            f"Marked email as sent for today ({current_date}). "
+            f"No more emails will be scheduled until tomorrow."
+        )
 
         return {
             "status": "sent",
@@ -1204,8 +1163,8 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     task_ids = []
     errors = []
     successful_count = 0
-    # Accumulate all non-existing product codes from all requests in batch
-    all_non_existing_codes = set()
+    # Note: Non-existing codes are now sent to EmailAccumulator directly from execute_request
+    # before retry exception is raised, so we don't need to collect them here
 
     # Process requests sequentially (one at a time)
     for req_data in requests:
@@ -1227,15 +1186,7 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         try:
             response_dict = await ctx.service_call(execute_request, request)
 
-            # Collect non-existing product codes from response
-            codes_from_response = response_dict.get("non_existing_codes", [])
-            if codes_from_response:
-                all_non_existing_codes.update(codes_from_response)
-                db_logger.info(
-                    f"Collected {len(codes_from_response)} codes from task_id {task_id}, "
-                    f"total accumulated: {len(all_non_existing_codes)}"
-                )
-
+            # Response returned successfully - no exception raised
             # Check success from dict directly
             if response_dict.get("success", False):
                 successful_count += 1
@@ -1249,12 +1200,13 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
                     }
                 )
         except Exception as e:
-            # Exception from execute_request (500 error that needs retry)
-            # The execute_request invocation will retry independently according to its retry policy
+            # Exception from execute_request - means retry is scheduled
+            # The execute_request invocation will retry according to InvocationRetryPolicy
+            # Codes were already sent to EmailAccumulator before exception was raised
             # We continue processing other requests in the batch
             db_logger.warning(
-                f"execute_request failed for task_id {task_id}: {str(e)} "
-                f"- this invocation will retry independently (next retry in 15 min)"
+                f"execute_request raised exception for task_id {task_id}: {str(e)} "
+                f"- invocation will retry according to retry policy (next retry in 15 min)"
             )
             errors.append(
                 {
@@ -1266,29 +1218,9 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
             )
             # Continue with next request - don't re-raise
 
-    # Send codes to EmailAccumulator Virtual Object for debounced email sending
-    db_logger.info(
-        f"Batch processing complete. Total unique non-existing codes collected: {len(all_non_existing_codes)}"
-    )
-
-    accumulator_result = {"status": "no_codes", "count": 0}
-    if all_non_existing_codes:
-        # Convert set to list
-        codes_list = list(all_non_existing_codes)
-        db_logger.info(
-            f"Sending {len(codes_list)} codes to EmailAccumulator (will send email after 5-minute debounce)..."
-        )
-
-        # Send to Virtual Object accumulator using a fixed key (all batches share same accumulator)
-        accumulator_result = await ctx.object_call(
-            add_codes,
-            key="global",  # Use single global accumulator for all batches
-            arg=codes_list,
-        )
-
-        db_logger.info(f"Accumulator response: {accumulator_result}")
-    else:
-        db_logger.info("No non-existing codes found in this batch")
+    # Batch processing complete
+    # Note: Codes were sent to EmailAccumulator directly from execute_request invocations
+    db_logger.info("Batch processing complete")
 
     # Return response with processing results
     batch_status_message = ""
@@ -1307,7 +1239,6 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         "errors": errors if errors else None,
         "batch_status": "all_succeeded" if not errors else "some_failed",
         "status_details": batch_status_message,
-        "accumulator_result": accumulator_result,
     }
 
 
