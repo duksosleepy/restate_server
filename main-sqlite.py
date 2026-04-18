@@ -1152,22 +1152,20 @@ def send_non_existing_codes_email_sync(codes: list) -> dict:
 @batch_service.handler("submit_batch")
 async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     """
-    Submit a batch of HTTP requests sequentially (one at a time).
+    Submit a batch of HTTP requests as fire-and-forget invocations.
 
-    Processes each request in order, waiting for each to complete before starting the next.
-    This prevents overloading the target server with parallel requests.
+    Each request is submitted independently and will retry automatically on failure.
+    This prevents the batch handler from blocking when individual requests fail.
 
     Args:
         requests: List of HTTP request data (batch of requests to process)
 
     Returns:
-        Status dict with task IDs and any errors encountered
+        Status dict with submitted task IDs
     """
     task_ids = []
-    errors = []
-    successful_count = 0
-    # Note: Non-existing codes are now sent to EmailAccumulator directly from execute_request
-    # before retry exception is raised, so we don't need to collect them here
+    # Note: Non-existing codes are sent to EmailAccumulator directly from execute_request
+    # before retry exception is raised
 
     # Process requests sequentially (one at a time)
     for req_data in requests:
@@ -1185,63 +1183,25 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         )
         task_ids.append(task_id)
 
-        # Execute request sequentially - await immediately before processing next request
-        try:
-            response_dict = await ctx.service_call(execute_request, request)
+        # Execute request using service_send (fire-and-forget)
+        # This prevents submit_batch from blocking when execute_request needs to retry
+        ctx.service_send(execute_request, request, idempotency_key=task_id)
 
-            # Response returned successfully - no exception raised
-            # Check success from dict directly
-            if response_dict.get("success", False):
-                successful_count += 1
-            else:
-                errors.append(
-                    {
-                        "task_id": task_id,
-                        "error": response_dict.get("error", "Unknown error"),
-                        "status_code": response_dict.get("status_code", 0),
-                        "response_data": response_dict.get("response_data", {}),
-                    }
-                )
-        except Exception as e:
-            # Exception from execute_request - means retry is scheduled
-            # The execute_request invocation will retry according to InvocationRetryPolicy
-            # Codes were already sent to EmailAccumulator before exception was raised
-            # We continue processing other requests in the batch
-            db_logger.warning(
-                f"execute_request raised exception for task_id {task_id}: {str(e)} "
-                f"- invocation will retry according to retry policy (next retry in 15 min)"
-            )
-            errors.append(
-                {
-                    "task_id": task_id,
-                    "error": f"Retrying: {str(e)}",
-                    "status_code": 0,
-                    "response_data": {},
-                }
-            )
-            # Continue with next request - don't re-raise
+        db_logger.info(
+            f"Submitted execute_request for task_id {task_id} (fire-and-forget)"
+        )
+        # Since we're using fire-and-forget, we can't track immediate success/failure
+        # But we know the invocation is scheduled and will retry if needed
 
     # Batch processing complete
-    # Note: Codes were sent to EmailAccumulator directly from execute_request invocations
-    db_logger.info("Batch processing complete")
-
-    # Return response with processing results
-    batch_status_message = ""
-    if not errors:
-        batch_status_message = "All tasks completed successfully"
-    else:
-        batch_status_message = (
-            f"{successful_count} succeeded, {len(errors)} failed - failed tasks will retry according to retry policy"
-        )
+    # All tasks submitted as fire-and-forget invocations
+    db_logger.info(f"Batch processing complete - submitted {len(task_ids)} tasks")
 
     return {
-        "message": f"Processed {len(task_ids)} tasks sequentially",
+        "message": f"Submitted {len(task_ids)} tasks for processing",
         "task_ids": task_ids,
-        "successful_count": successful_count,
-        "failed_count": len(errors),
-        "errors": errors if errors else None,
-        "batch_status": "all_succeeded" if not errors else "some_failed",
-        "status_details": batch_status_message,
+        "batch_status": "submitted",
+        "status_details": "All tasks submitted successfully. Each task will retry automatically on failure with 15-minute initial backoff.",
     }
 
 
