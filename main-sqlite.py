@@ -784,10 +784,10 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
 
         # Now determine retry behavior
         if has_non_existing_codes:
-            # Product code error - raise exception to trigger Restate retry
+            # Product code error - raise exception to trigger Restate retry with backoff
             db_logger.warning(
                 f"HttpTask failed with non-existing product code error for task_id: {request.task_id}, "
-                f"raising exception to trigger retry (next retry in 15 min)"
+                f"raising exception to trigger retry with backoff"
             )
             raise Exception(
                 f"Non-existing product code error: {response.error} (status_code: {response.status_code})"
@@ -798,13 +798,16 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
                 f"HttpTask failed with terminal error for task_id: {request.task_id}, "
                 f"status_code: {response.status_code}, completing without retry"
             )
-            # Return response to complete invocation
-            return response.model_dump()
+            # Raise TerminalError to signal Restate not to retry
+            raise TerminalError(
+                f"Terminal HTTP error: {response.error} (status_code: {response.status_code})",
+                status_code=response.status_code,
+            )
         else:
-            # 5xx server errors - raise exception to trigger retry
+            # 5xx server errors - raise exception to trigger retry with backoff
             db_logger.warning(
                 f"HttpTask failed with server error for task_id: {request.task_id}, "
-                f"status_code: {response.status_code}, raising exception to trigger retry"
+                f"status_code: {response.status_code}, raising exception to trigger retry with backoff"
             )
             raise Exception(
                 f"HTTP request failed: {response.error} (status_code: {response.status_code})"
