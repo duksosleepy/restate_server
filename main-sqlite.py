@@ -820,6 +820,50 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
     raise Exception("Unexpected error in execute_request handler")
 
 
+# Virtual Object for rate-limiting HTTP requests to CRM server
+# Uses sequential processing with 1-second delay between requests
+request_throttler = VirtualObject("RequestThrottler")
+
+
+@request_throttler.handler()
+async def process_request(ctx: ObjectContext, request_data: dict) -> Dict[str, Any]:
+    """
+    Process a single HTTP request with 1-second delay to prevent CRM overload.
+
+    This handler uses a Virtual Object with a single key to ensure all requests
+    are processed sequentially with exactly 1 second delay between each request.
+
+    Args:
+        request_data: Dictionary containing url, data, and task_id
+
+    Returns:
+        Status dict with task_id
+    """
+    # Sleep for 1 second before processing the request
+    # This creates a durable timer that survives crashes
+    await ctx.sleep(timedelta(seconds=1))
+
+    # Create HttpRequest object from request_data
+    request = HttpRequest(
+        url=request_data["url"],
+        data=request_data["data"],
+        task_id=request_data["task_id"]
+    )
+
+    # Execute the request using service_send (fire-and-forget)
+    # This ensures the throttler doesn't block waiting for the result
+    ctx.service_send(execute_request, request, idempotency_key=request.task_id)
+
+    db_logger.info(
+        f"Throttler: processed request for task_id {request.task_id} after 1-second delay"
+    )
+
+    return {
+        "status": "submitted",
+        "task_id": request.task_id
+    }
+
+
 # Virtual Object for managing non-existing codes accumulation and debounced email
 email_accumulator = VirtualObject("EmailAccumulator")
 
@@ -889,25 +933,25 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
     email_scheduled = await ctx.get("email_scheduled") or False
 
     if not email_scheduled:
-        # Schedule delayed email send (5 minutes from now)
-        db_logger.info("Scheduling email send in 5 minutes...")
+        # Schedule delayed email send (10 minutes from now)
+        db_logger.info("Scheduling email send in 10 minutes...")
 
         # Mark email as scheduled
         ctx.set("email_scheduled", True)
 
-        # Send delayed message to ourselves to trigger email after 5 minutes
+        # Send delayed message to ourselves to trigger email after 10 minutes
         ctx.object_send(
             send_accumulated_email,
             key=ctx.key(),
             arg=None,
-            send_delay=timedelta(minutes=5),
+            send_delay=timedelta(minutes=10),
         )
 
         return {
             "status": "scheduled",
             "accumulated_count": len(accumulated_codes),
             "date": current_date,
-            "message": "Email scheduled for 5 minutes from now"
+            "message": "Email scheduled for 10 minutes from now"
         }
     else:
         return {
@@ -922,7 +966,7 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
 async def send_accumulated_email(ctx: ObjectContext) -> Dict[str, Any]:
     """
     Send email with all accumulated codes and reset the accumulator.
-    Called automatically after 5-minute delay.
+    Called automatically after 10-minute delay.
 
     Note: Does NOT clear last_date - this allows proper new day detection.
     """
@@ -1152,10 +1196,10 @@ def send_non_existing_codes_email_sync(codes: list) -> dict:
 @batch_service.handler("submit_batch")
 async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     """
-    Submit a batch of HTTP requests as fire-and-forget invocations.
+    Submit a batch of HTTP requests through the rate-limiting throttler.
 
-    Each request is submitted independently and will retry automatically on failure.
-    This prevents the batch handler from blocking when individual requests fail.
+    Each request is submitted to the RequestThrottler Virtual Object which ensures
+    a 1-second delay between requests to prevent CRM server overload.
 
     Args:
         requests: List of HTTP request data (batch of requests to process)
@@ -1167,7 +1211,7 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     # Note: Non-existing codes are sent to EmailAccumulator directly from execute_request
     # before retry exception is raised
 
-    # Process requests sequentially (one at a time)
+    # Process requests - submit each to the rate-limiting throttler
     for req_data in requests:
         # Generate unique task_id using hash of the entire request data
         # This ensures each order item gets a unique ID even with same maDonHang
@@ -1178,30 +1222,40 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
         except (KeyError, IndexError, TypeError) as e:
             raise ValueError(f"Failed to generate task_id from request data: {e}")
 
-        request = HttpRequest(
-            url=req_data["url"], data=req_data["data"], task_id=task_id
-        )
         task_ids.append(task_id)
 
-        # Execute request using service_send (fire-and-forget)
-        # This prevents submit_batch from blocking when execute_request needs to retry
-        ctx.service_send(execute_request, request, idempotency_key=task_id)
+        # Prepare request data for the throttler
+        request_data = {
+            "url": req_data["url"],
+            "data": req_data["data"],
+            "task_id": task_id
+        }
+
+        # Submit to RequestThrottler using object_send (fire-and-forget)
+        # All requests use the same key "global" to ensure sequential processing
+        # The throttler will add 1-second delay between each request
+        ctx.object_send(
+            process_request,
+            key="global",  # Single key ensures all requests are serialized
+            arg=request_data
+        )
 
         db_logger.info(
-            f"Submitted execute_request for task_id {task_id} (fire-and-forget)"
+            f"Submitted request to throttler for task_id {task_id}"
         )
-        # Since we're using fire-and-forget, we can't track immediate success/failure
-        # But we know the invocation is scheduled and will retry if needed
 
     # Batch processing complete
-    # All tasks submitted as fire-and-forget invocations
-    db_logger.info(f"Batch processing complete - submitted {len(task_ids)} tasks")
+    # All tasks submitted to the rate-limiting throttler
+    db_logger.info(
+        f"Batch processing complete - submitted {len(task_ids)} tasks to throttler "
+        f"(1-second delay between requests)"
+    )
 
     return {
-        "message": f"Submitted {len(task_ids)} tasks for processing",
+        "message": f"Submitted {len(task_ids)} tasks for rate-limited processing",
         "task_ids": task_ids,
         "batch_status": "submitted",
-        "status_details": "All tasks submitted successfully. Each task will retry automatically on failure with 15-minute initial backoff.",
+        "status_details": "All tasks submitted to rate limiter. Requests will be sent with 1-second delay between each. Each task will retry automatically on failure with 15-minute initial backoff.",
     }
 
 
@@ -1231,7 +1285,7 @@ async def cleanup_old_failed_orders(
     return {"message": result}
 
 
-application = app(services=[batch_service, http_task, email_accumulator])
+application = app(services=[batch_service, http_task, request_throttler, email_accumulator])
 
 if __name__ == "__main__":
     import hypercorn.asyncio
