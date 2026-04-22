@@ -821,17 +821,17 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
 
 
 # Virtual Object for rate-limiting HTTP requests to CRM server
-# Uses sequential processing with 1-second delay between requests
+# Uses sequential processing with 2-second delay between requests
 request_throttler = VirtualObject("RequestThrottler")
 
 
 @request_throttler.handler()
 async def process_request(ctx: ObjectContext, request_data: dict) -> Dict[str, Any]:
     """
-    Process a single HTTP request with 1-second delay to prevent CRM overload.
+    Process a single HTTP request with 2-second delay to prevent CRM overload.
 
     This handler uses a Virtual Object with a single key to ensure all requests
-    are processed sequentially with exactly 1 second delay between each request.
+    are processed sequentially with exactly 2 seconds delay between each request.
 
     Args:
         request_data: Dictionary containing url, data, and task_id
@@ -839,9 +839,9 @@ async def process_request(ctx: ObjectContext, request_data: dict) -> Dict[str, A
     Returns:
         Status dict with task_id
     """
-    # Sleep for 1 second before processing the request
+    # Sleep for 2 seconds before processing the request
     # This creates a durable timer that survives crashes
-    await ctx.sleep(timedelta(seconds=1))
+    await ctx.sleep(timedelta(seconds=2))
 
     # Create HttpRequest object from request_data
     request = HttpRequest(
@@ -855,7 +855,7 @@ async def process_request(ctx: ObjectContext, request_data: dict) -> Dict[str, A
     ctx.service_send(execute_request, request, idempotency_key=request.task_id)
 
     db_logger.info(
-        f"Throttler: processed request for task_id {request.task_id} after 1-second delay"
+        f"Throttler: processed request for task_id {request.task_id} after 2-second delay"
     )
 
     return {
@@ -933,25 +933,25 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
     email_scheduled = await ctx.get("email_scheduled") or False
 
     if not email_scheduled:
-        # Schedule delayed email send (10 minutes from now)
-        db_logger.info("Scheduling email send in 10 minutes...")
+        # Schedule delayed email send (20 minutes from now)
+        db_logger.info("Scheduling email send in 20 minutes...")
 
         # Mark email as scheduled
         ctx.set("email_scheduled", True)
 
-        # Send delayed message to ourselves to trigger email after 10 minutes
+        # Send delayed message to ourselves to trigger email after 20 minutes
         ctx.object_send(
             send_accumulated_email,
             key=ctx.key(),
             arg=None,
-            send_delay=timedelta(minutes=10),
+            send_delay=timedelta(minutes=20),
         )
 
         return {
             "status": "scheduled",
             "accumulated_count": len(accumulated_codes),
             "date": current_date,
-            "message": "Email scheduled for 10 minutes from now"
+            "message": "Email scheduled for 20 minutes from now"
         }
     else:
         return {
@@ -966,7 +966,7 @@ async def add_codes(ctx: ObjectContext, codes: list[str]) -> Dict[str, Any]:
 async def send_accumulated_email(ctx: ObjectContext) -> Dict[str, Any]:
     """
     Send email with all accumulated codes and reset the accumulator.
-    Called automatically after 10-minute delay.
+    Called automatically after 20-minute delay.
 
     Note: Does NOT clear last_date - this allows proper new day detection.
     """
@@ -1248,14 +1248,14 @@ async def submit_batch(ctx: Context, requests: list) -> Dict[str, str]:
     # All tasks submitted to the rate-limiting throttler
     db_logger.info(
         f"Batch processing complete - submitted {len(task_ids)} tasks to throttler "
-        f"(1-second delay between requests)"
+        f"(2-second delay between requests)"
     )
 
     return {
         "message": f"Submitted {len(task_ids)} tasks for rate-limited processing",
         "task_ids": task_ids,
         "batch_status": "submitted",
-        "status_details": "All tasks submitted to rate limiter. Requests will be sent with 1-second delay between each. Each task will retry automatically on failure with 15-minute initial backoff.",
+        "status_details": "All tasks submitted to rate limiter. Requests will be sent with 2-second delay between each. Each task will retry automatically on failure with 15-minute initial backoff.",
     }
 
 
