@@ -673,9 +673,14 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
                 needs_manual_retry=True,
             ).model_dump()
 
-    # Execute the HTTP request durably
-    # The http_request step will always complete (either success or failure response)
-    response_dict = await ctx.run_typed("http_request", make_http_request)
+    # Execute the HTTP request WITHOUT durable wrapping
+    # This allows fresh HTTP calls on every retry attempt, which is necessary
+    # because external CRM state may change (e.g., product codes added to system)
+    # NOTE: We lose crash recovery for HTTP responses, but this is acceptable because:
+    # 1. CRM API is idempotent (detects duplicates: "Chứng từ ... đã nhập.")
+    # 2. We handle duplicate responses gracefully (line 703-718)
+    # 3. Fresh requests on retry are DESIRED when CRM state changes over time
+    response_dict = await make_http_request()
     # Convert dict back to HttpResponse object
     response = HttpResponse(**response_dict)
 
@@ -698,6 +703,18 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
         if error_code:  # Only process if errorCode is not empty/None
             # Only process if error_code is a string
             if isinstance(error_code, str):
+                # Ensure proper UTF-8 encoding FIRST (before pattern matching)
+                # This fixes Unicode escapes like "\u00e3" → "ã" in cached journal entries
+                try:
+                    error_code = (
+                        error_code.encode("utf-8")
+                        .decode("unicode_escape")
+                        .encode("latin1")
+                        .decode("utf-8")
+                    )
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    pass
+
                 # Check for duplicate document pattern first
                 duplicate_pattern = r"Chứng từ\s+.+?\s+đã nhập\."
                 if re.search(duplicate_pattern, error_code):
@@ -736,17 +753,6 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
                         f"Extracted {len(unique_codes)} unique non-existing product codes "
                         f"from error for task_id: {request.task_id}: {unique_codes}"
                     )
-
-                # Ensure proper UTF-8 encoding
-                try:
-                    error_code = (
-                        error_code.encode("utf-8")
-                        .decode("unicode_escape")
-                        .encode("latin1")
-                        .decode("utf-8")
-                    )
-                except (UnicodeDecodeError, UnicodeEncodeError):
-                    pass
 
             # Log failed order (database operation removed)
             db_logger.info(f"Failed order logged for task_id: {request.task_id}")
