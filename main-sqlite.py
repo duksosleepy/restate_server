@@ -673,14 +673,12 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
                 needs_manual_retry=True,
             ).model_dump()
 
-    # Execute the HTTP request WITHOUT durable wrapping
-    # This allows fresh HTTP calls on every retry attempt, which is necessary
-    # because external CRM state may change (e.g., product codes added to system)
-    # NOTE: We lose crash recovery for HTTP responses, but this is acceptable because:
-    # 1. CRM API is idempotent (detects duplicates: "Chứng từ ... đã nhập.")
-    # 2. We handle duplicate responses gracefully (line 703-718)
-    # 3. Fresh requests on retry are DESIRED when CRM state changes over time
-    response_dict = await make_http_request()
+    # Execute the HTTP request with a unique step name per attempt
+    # This ensures each retry makes a FRESH HTTP request to the CRM server
+    # (using timestamp makes each retry attempt use a different journal entry)
+    import time
+    step_name = f"http_request_{int(time.time() * 1000)}"  # millisecond precision
+    response_dict = await ctx.run_typed(step_name, make_http_request)
     # Convert dict back to HttpResponse object
     response = HttpResponse(**response_dict)
 
