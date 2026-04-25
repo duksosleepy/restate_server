@@ -673,12 +673,14 @@ async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
                 needs_manual_retry=True,
             ).model_dump()
 
-    # Execute the HTTP request with a unique step name per attempt
-    # This ensures each retry makes a FRESH HTTP request to the CRM server
-    # (using timestamp makes each retry attempt use a different journal entry)
-    import time
-    step_name = f"http_request_{int(time.time() * 1000)}"  # millisecond precision
-    response_dict = await ctx.run_typed(step_name, make_http_request)
+    # SOLUTION: Call HTTP request directly WITHOUT ctx.run_typed()
+    # This is the ONLY way to get fresh HTTP requests on every retry
+    # Trade-off: We lose Restate's crash recovery for the HTTP response
+    # But this is acceptable because:
+    #   1. CRM API is idempotent (detects duplicates)
+    #   2. Fresh requests are REQUIRED when CRM state changes
+    response_dict = await make_http_request()
+
     # Convert dict back to HttpResponse object
     response = HttpResponse(**response_dict)
 
