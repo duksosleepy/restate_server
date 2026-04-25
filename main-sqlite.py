@@ -618,7 +618,11 @@ def purge_batch_invocation(invocation_id: str) -> str:
 
 @http_task.handler("execute_request")
 async def execute_request(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
-    """Execute a single HTTP request with error handling and auto-retry"""
+    """Execute a single HTTP request with error handling and auto-retry
+
+    LEGACY VERSION: This handler is kept for backward compatibility with old invocations.
+    New requests should use execute_request_v2 instead.
+    """
 
     async def make_http_request():
         try:
@@ -859,7 +863,8 @@ async def process_request(ctx: ObjectContext, request_data: dict) -> Dict[str, A
 
     # Execute the request using service_send (fire-and-forget)
     # This ensures the throttler doesn't block waiting for the result
-    ctx.service_send(execute_request, request, idempotency_key=request.task_id)
+    # Use execute_request_v2 for new invocations (fresh HTTP on retry)
+    ctx.service_send(execute_request_v2, request, idempotency_key=request.task_id)
 
     db_logger.info(
         f"Throttler: processed request for task_id {request.task_id} after 2-second delay"
@@ -1198,6 +1203,151 @@ def send_non_existing_codes_email_sync(codes: list) -> dict:
         except:
             pass
         return {"status": "failed", "error": str(e), "count": 0}
+
+
+@http_task.handler("execute_request_v2")
+async def execute_request_v2(ctx: Context, request: HttpRequest) -> Dict[str, Any]:
+    """Execute a single HTTP request with error handling and auto-retry
+
+    V2 VERSION: Makes fresh HTTP requests on every retry (no journal caching).
+    This version is used for all new invocations.
+    """
+
+    async def make_http_request():
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    request.url, json=request.data, timeout=30.0
+                )
+
+                # Parse response data
+                response_data = response.json() if response.content else {}
+
+                # Check for error status codes
+                if response.status_code in [
+                    400, 401, 403, 404, 500, 502, 503, 504,
+                ]:
+                    return HttpResponse(
+                        task_id=request.task_id,
+                        url=request.url,
+                        status_code=response.status_code,
+                        response_data=response_data,
+                        success=False,
+                        error=f"HTTP {response.status_code} error",
+                        needs_manual_retry=True,
+                    ).model_dump()
+
+                # Success case
+                return HttpResponse(
+                    task_id=request.task_id,
+                    url=request.url,
+                    status_code=response.status_code,
+                    response_data=response_data,
+                    success=True,
+                ).model_dump()
+
+        except Exception as e:
+            return HttpResponse(
+                task_id=request.task_id,
+                url=request.url,
+                status_code=0,
+                response_data={},
+                success=False,
+                error=str(e),
+                needs_manual_retry=True,
+            ).model_dump()
+
+    # Make fresh HTTP request (NO ctx.run_typed caching)
+    response_dict = await make_http_request()
+    response = HttpResponse(**response_dict)
+
+    # Handle success case
+    if response.success:
+        db_logger.info(f"HTTP request succeeded for task_id: {request.task_id}")
+        return response.model_dump()
+
+    # Handle failure case
+    if response.needs_manual_retry:
+        error_code = (
+            response.response_data.get("errorCode")
+            if response.response_data
+            else None
+        )
+
+        if error_code:
+            if isinstance(error_code, str):
+                # Ensure proper UTF-8 encoding FIRST (before pattern matching)
+                try:
+                    error_code = (
+                        error_code.encode("utf-8")
+                        .decode("unicode_escape")
+                        .encode("latin1")
+                        .decode("utf-8")
+                    )
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    pass
+
+                # Check for duplicate document pattern
+                duplicate_pattern = r"Chứng từ\s+.+?\s+đã nhập\."
+                if re.search(duplicate_pattern, error_code):
+                    db_logger.info(
+                        f"Duplicate document detected for task_id: {request.task_id}"
+                    )
+                    return HttpResponse(
+                        task_id=request.task_id,
+                        url=request.url,
+                        status_code=response.status_code,
+                        response_data=response.response_data,
+                        success=True,
+                        error=f"Duplicate document detected: {error_code}",
+                        needs_manual_retry=False,
+                    ).model_dump()
+
+                # Extract product codes
+                pattern = r"Mã hàng\s+([^\s]+(?:\s+[^\s]+)*?)\s+không tồn tại trong hệ thống"
+                matches = re.findall(pattern, error_code)
+
+                has_non_existing_codes = False
+                if matches:
+                    unique_codes = list(set(matches))
+                    response.non_existing_codes = unique_codes
+                    has_non_existing_codes = True
+                    db_logger.info(
+                        f"Extracted {len(unique_codes)} unique non-existing product codes "
+                        f"from error for task_id: {request.task_id}: {unique_codes}"
+                    )
+        else:
+            # Empty errorCode means success
+            db_logger.info(f"Empty errorCode for task_id: {request.task_id}")
+            return response.model_dump()
+
+        # Send codes to EmailAccumulator BEFORE raising exception
+        if has_non_existing_codes and response.non_existing_codes:
+            try:
+                await ctx.object_call(
+                    add_codes,
+                    key="global",
+                    arg=response.non_existing_codes,
+                )
+            except Exception as e:
+                db_logger.error(f"Failed to send codes to EmailAccumulator: {str(e)}")
+
+        # Raise exception to trigger retry
+        if has_non_existing_codes:
+            raise Exception(
+                f"Non-existing product code error: {response.error} (status_code: {response.status_code})"
+            )
+        elif response.status_code in [400, 401, 403, 404]:
+            raise TerminalError(
+                f"Terminal HTTP error: {response.error} (status_code: {response.status_code})",
+                status_code=response.status_code,
+            )
+        else:
+            raise Exception(
+                f"HTTP request failed: {response.error} (status_code: {response.status_code})"
+            )
+
+    raise Exception("Unexpected error in execute_request_v2 handler")
 
 
 @batch_service.handler("submit_batch")
