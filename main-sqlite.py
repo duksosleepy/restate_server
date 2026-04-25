@@ -158,6 +158,7 @@ http_task = Service(
         max_attempts=100,  # Allow up to 100 retry attempts
         on_max_attempts='pause',  # Pause invocation instead of killing it after max attempts
     ),
+    journal_retention=timedelta(days=2),  # Retain journal for 2 days after completion
 )
 
 
