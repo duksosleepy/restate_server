@@ -159,6 +159,7 @@ http_task = Service(
         on_max_attempts='pause',  # Pause invocation instead of killing it after max attempts
     ),
     journal_retention=timedelta(days=2),  # Retain journal for 2 days after completion
+    idempotency_retention=timedelta(days=2),  # Retain idempotency keys for 2 days (matches journal retention)
 )
 
 
